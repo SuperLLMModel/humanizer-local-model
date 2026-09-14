@@ -202,7 +202,10 @@ def verbatim_pair(draft, out, thr=0.9):
     """返回 (verbatim_out, verbatim_draft):
        verbatim_out   输出句里有多大比例几乎整句来自草稿(该输出句 ≥.9 落在某草稿句里,或某草稿句 ≥.9 落在它里面)
        verbatim_draft 草稿句里有多大比例被输出几乎整句复现(≥.9 有序包含在某输出句里)
-       只有够长的句子参与(英文 ≥5 词、中文 ≥8 字),碎片不算。"""
+       只有够长的句子参与(英文 ≥5 词、中文 ≥8 字),碎片不算。
+       09-13:两个比例都改成【按词/字数】计权。原来按句数等权,于是改不动的样板行(`## v2.3.2 (2026-09-12)`、
+       `- Bump x from A to B (#N).`、带 @负责人 和截止日期的待办行)被超额计权,一篇正文全改写过的
+       变更日志/会议纪要照样冲过 0.35 吃 −8。"""
     ds = [(s, _units(s)) for s in sentences(draft)]; os_ = [(s, _units(s)) for s in sentences(out)]
     ds = [(s, u) for s, u in ds if _long_enough(u, s)]; os_ = [(s, u) for s, u in os_ if _long_enough(u, s)]
     if not ds or not os_:
@@ -217,8 +220,10 @@ def verbatim_pair(draft, out, thr=0.9):
             elif not this and _contain(uo, ud) >= thr:   # 输出句是草稿句的一块
                 this = True
         if this:
-            hit_o += 1
-    return hit_o / len(os_), sum(hit_d) / len(ds)
+            hit_o += len(uo)                # 09-13:按词/字数计权,不按句数
+    tot_o = sum(len(u) for _, u in os_) or 1
+    tot_d = sum(len(u) for _, u in ds) or 1
+    return hit_o / tot_o, sum(len(u) for (s_, u), h in zip(ds, hit_d) if h) / tot_d
 
 
 def verbatim_sent(draft, out, thr=0.9):
@@ -231,6 +236,84 @@ def lcs_content(draft, out):
        用作 identity 兜底,不进 copy 的 max(见 all_metrics 注释)。"""
     a = tokens(draft); b = tokens(out)
     return _contain(a, b)
+
+
+def skeleton(t):
+    """抹掉实词,只留虚词 + 标点 + 数字位。同义替换时骨架一字不变,所以它抓得住 copy 漏掉的那类抄。
+       中文返回 None:虚词骨架在中文失效(没有英文那样干净的虚词表),退回纯 copy —— 已知缺口,别假装填上。"""
+    if _CJK.search(t or ''):
+        return None
+    out = []
+    for w in re.findall(r"[A-Za-z']+|[0-9][0-9,.%$]*|[^\sA-Za-z0-9]", t or ''):
+        if re.match(r"[A-Za-z']", w):
+            out.append(w.lower() if w.lower() in _STOP else 'W')
+        elif re.match(r'[0-9]', w):
+            out.append('N')
+        else:
+            out.append(w)
+    return out
+
+
+def skeleton_recall(draft, out, n=5):
+    """草稿骨架的 5-gram 有多少在输出里出现。分母是【草稿】,所以灌废话稀释不了。"""
+    a, b = skeleton(draft), skeleton(out)
+    if a is None or b is None:
+        return None
+    bs = set(tuple(b[i:i + n]) for i in range(len(b) - n + 1))
+    g = [tuple(a[i:i + n]) for i in range(len(a) - n + 1)]
+    return sum(1 for x in g if x in bs) / len(g) if g else 0.0
+
+
+def reuse(draft, out):
+    """复用率 = max(词面照抄, 句法骨架复用)。两条互补,实测(09-13):
+
+         攻击/对照              copy   骨架
+         原样照抄               1.00   1.00
+         逐句同义替换(句序不动)   0.28   0.90   ← copy 漏,骨架抓
+         照抄+每句插填充词        1.00   0.29   ← 骨架漏,copy 抓
+         照抄+灌废话            1.00   1.00
+         真改写                 0.00   0.00   ← 都放过
+         真重构                 0.00   0.00   ← 都放过
+
+       为什么用 max 不是两项:同题材内 Spearman 0.77,高度相关,两项等于把照抄权重乘二。
+       骨架的分母是草稿,与 draft_coverage 同理 —— 源长度当分母有 Broder containment、JPlag
+       similarityOfFirst、ROUGE recall、SARI、MOSS、GPLAG、PAN recall 七条先例。
+    """
+    c = copy(draft, out)
+    sk = skeleton_recall(draft, out)
+    return c if sk is None else max(c, sk)
+
+
+def extractive_fragments(draft, out):
+    """Grusky et al. (NAACL 2018) 的抽取式片段 → (coverage, density)。
+
+    coverage = 输出里有多少词属于"从草稿整段搬来"的片段;density = 每个词所属片段的平均长度(平方加权)。
+    人名、数字、术语必须逐字保留,它们抬高 coverage 但不抬高 density —— 所以 density 才是
+    "有没有抄措辞"的公平量,而 copy_5gram 把两者混在一起还硬卡在 5 词窗口。
+
+    ★ 只作【诊断】,不许进奖励:09-13 实测 density 按输出长度归一,"照抄+每句插填充词"能把它从 37 压到 2.67,
+      而真改写是 1.90 —— 几乎分不开。copy 的 max-of-four 里有 draft_coverage(分母是草稿),灌废话稀释不了,
+      所以奖励仍然用 copy。
+    """
+    A = _words(draft); S = _words(out)
+    if not S:
+        return 0.0, 0.0
+    F = []; i = 0
+    while i < len(S):
+        f = []; j = 0
+        while j < len(A):
+            if S[i] == A[j]:
+                i_, j_ = i, j
+                while i_ < len(S) and j_ < len(A) and S[i_] == A[j_]:
+                    i_ += 1; j_ += 1
+                if len(f) < i_ - i:
+                    f = S[i:i_]
+                j = j_
+            else:
+                j += 1
+        i += max(len(f), 1)
+        if f: F.append(f)
+    return sum(len(x) for x in F) / len(S), sum(len(x) ** 2 for x in F) / len(S)
 
 
 def copy(draft, out):
@@ -270,23 +353,93 @@ def fact_recall(draft, out):
 
 
 _FMT = re.compile(r'^\s*(?:(?:subject|re|fw|fwd|to|from|cc|date|title)\s*[:：]|(?:dear|hi|hello|hey|good (?:morning|afternoon|evening))\b|(?:best|best regards|best wishes|regards|kind regards|warm regards|warmly|sincerely|sincerely yours|cheers|thanks|thank you|many thanks|thanks again|yours|yours truly|respectfully|take care|talk soon|all the best)\s*[,!.]?\s*$|#{1,6}\s|(?:尊敬的|亲爱的|各位|敬爱的)|[^\s,，:：]{1,12}(?:老师|教授|同学|先生|女士|经理|总|博士|主任|导师)[:：,，]?\s*$|(?:此致|敬礼|祝好|祝安|祝|顺祝|顺颂|谢谢|感谢|敬上|谨上|学生|申请人|您好)[:：!！。,，]?\s*$)', re.I)
-_SIG = re.compile(r'[\w.+-]+@[\w-]+\.[\w.-]+|\d{4}[-/年.]\d{1,2}([-/月.]\d{1,2}日?)?|^\s*[-—–]{1,3}\s*\S')
+_SIG = re.compile(r'[\w.+-]+@[\w-]+\.[\w.-]+|\d{4}[-/年.]\d{1,2}([-/月.]\d{1,2}日?)?|^\s*[—–]{1,2}\s*\S')
+
+
+_FENCE = re.compile(r'^\s*(?:```|~~~)')
+_RULE_LN = re.compile(r'^\s*(?:[-*_]\s*){3,}$')
+_FIELD = re.compile(r'^\s*[A-Za-z][A-Za-z /_-]{0,20}\s*[:：]\s*\S')
+_ENDPUNCT = re.compile(r'[.!?。!?…]["\'”’)\]]?\s*$')
+_DATAISH = re.compile(r'\d|@|https?://|www\.|\.(?:com|org|net|io|edu|gov|cn)\b|[/\\]|[—–|·]\s*\S+\s*[—–|·]')
+_SIGNOFF = re.compile(r'^\s*(?:best|best regards|best wishes|regards|kind regards|warm regards|warmly|sincerely|'
+                      r'sincerely yours|cheers|thanks|thanks again|thank you|many thanks|yours|yours truly|'
+                      r'respectfully|take care|talk soon|all the best|thanks so much|thanks a lot|warm wishes|gratefully|with appreciation|much appreciated|appreciate it|with thanks|best of luck)\s*[,!.]?\s*$'
+                      r'|^\s*(?:此致|敬礼|祝好|祝安|顺祝|顺颂|敬上|谨上)[:：!！。,,]?\s*$', re.I)
+_GREET = re.compile(r'^\s*(?:dear|hi|hello|hey|good (?:morning|afternoon|evening))\b'
+                    r'|^\s*(?:尊敬的|亲爱的|各位|敬爱的)'
+                    r'|^[^\s,,::]{1,12}(?:老师|教授|同学|先生|女士|经理|总|博士|主任|导师)[:：,,]?\s*$', re.I)
+
+
+def _dataish(ln):
+    """这行像不像"数据"而不是"话":含数字/邮箱/链接/路径,或 Title Case 密集(公司名、职位、地名)。"""
+    if _DATAISH.search(ln):
+        return True
+    w = [x for x in ln.split() if x[:1].isalpha()]
+    return len(w) >= 2 and sum(1 for x in w if x[:1].isupper()) / len(w) >= 0.6
+
+
+def split_prose(t):
+    """把一段文本切成 (散文行, 结构行)。结构行 = 设计上就要求一字不改的东西(2026-09-13)。
+
+    为什么换掉按行枚举格式要素的老路:09-13 的误报筛查(106 个 agent、16 个格式家族、逐条独立复现)
+    确认 70 条误报,其中 18 条是照抄硬失败 −8,全是同一个病 —— 主题行、签名块、Markdown 表格、
+    代码块、引用块、联系方式、版本标题、待办勾选行、依赖升级行这些必须逐字保留的东西进了照抄率的分母,
+    于是保留得越忠实照抄率越高。老办法 split_format 逐条枚举"什么算格式",枚举不完(光 line 291 一处就吃了 8 条)。
+    这里反过来只认散文,认不出来的一律归结构:宁可少算照抄,不可冤枉合法改写。
+    真照抄仍然抓得住 —— 整篇照抄时散文行同样被逐字抄了(tests/test_fp.py 有负样本守着)。
+    """
+    prose, struct = [], []
+    fence = False; after_signoff = False
+    lines = (strip_markup(t) or '').split('\n')   # 先剥 HTML:块级标签变换行,否则 <p> 会被当成一整行长散文,
+                                                #   标签本身还会污染 5-gram(09-13 自测 S9 那行抓到的)
+    nonempty = [i for i, ln in enumerate(lines) if ln.strip()]
+    head = set(nonempty[:3])
+    for i, raw in enumerate(lines):
+        ln = raw.strip()
+        if _FENCE.match(raw):
+            fence = not fence; struct.append(ln); continue
+        if not ln:
+            continue
+        if fence:
+            struct.append(ln); continue
+        if _SIGNOFF.match(ln):
+            after_signoff = True; struct.append(ln); continue     # 落款之后全是签名块
+        cjk = bool(_CJK.search(ln)); nw = len(tokens(ln))
+        drop = (after_signoff
+                or raw.startswith('    ') or raw.startswith('\t')          # 缩进代码块
+                or ln.startswith('>') or ln.startswith('#')                # 引用 / 标题
+                or _RULE_LN.match(ln) or raw.count('|') >= 2               # 分隔线 / 表格行
+                or (i in head and _FIELD.match(ln) and (len(ln) <= 30 if cjk else nw <= 12))
+                #   ↑ 抬头字段 Subject:/To:/Date: —— 必须带长度护栏。09-13 实测:没护栏时
+                #     'What I love: the heat retention is unmatched…' 这种 500 字的正文段会被整条剥掉,
+                #     跟当天早些时候中文 split_format 吃掉 157 字正文是同一个病
+                or (_GREET.match(ln) and (len(ln) <= 30 if cjk else nw <= 8))   # 称呼行(带长度护栏)
+                or (_LIST.match(ln) and (len(ln) < 16 if cjk else nw < 8))      # 短列表项 = 数据行
+                or (not _ENDPUNCT.search(ln) and (len(ln) <= 16 if cjk else nw <= 8) and _dataish(ln)))
+        (struct if drop else prose).append(ln)
+    return '\n'.join(prose), struct
+
+
+def prose_lines(t):
+    return split_prose(t)[0]
 
 
 def split_format(t):
     """把文档格式要素(主题行/标题/称呼/落款/签名块/联系方式)和正文分开。返回 (格式行列表, 正文)。
-       规则:匹配 _FMT 的行;开头 2 行里 ≤6 词/≤12 字的短行;结尾 4 行里 ≤5 词/≤12 字的短行或含邮箱/日期的行。"""
+       规则:匹配 _FMT 的行;开头 2 行里 ≤6 词/≤12 字的短行;结尾 4 行里 ≤5 词/≤12 字的短行或含邮箱/日期的行。
+       09-12 修:中文三条判据全部失效过(称呼分支无行尾锚、长度护栏被 or _CJK 短路、nw<=12 对无空格中文恒真),
+       导致 157 字的整段正文被当成格式行剥掉,copy 从 0.25 虚高到 1.00,合法中文改写在 RL 里吃 -8 硬失败。"""
     lines = [ln for ln in (strip_markup(t) or '').split('\n')]
     nonempty = [i for i, ln in enumerate(lines) if ln.strip()]
     fmt = set()
     for pos, i in enumerate(nonempty):
         ln = lines[i].strip(); nw = len(ln.split()); nc = len(ln)
         short = (nw <= 6 and nc <= 60) if not _CJK.search(ln) else nc <= 12
-        if _FMT.match(ln) and (nw <= 14 or _CJK.search(ln)):
+        if _FMT.match(ln) and ((nc <= 30) if _CJK.search(ln) else nw <= 14):
             fmt.add(i)
         elif pos < 2 and short:
             fmt.add(i)
-        elif pos >= len(nonempty) - 4 and ((nw <= 4 and nc <= 40) if not _CJK.search(ln) else nc <= 8 or _SIG.search(ln)) and nw <= 12:
+        elif pos >= len(nonempty) - 4 and ((nw <= 4 and nc <= 40 and nw <= 12) if not _CJK.search(ln) else (nc <= 8 or (_SIG.search(ln) and nc <= 40))):
             fmt.add(i)                      # 结尾短行(署名/职务/日期/邮箱);"Thank you for considering this." 这种整句不算
     body = '\n'.join(ln for i, ln in enumerate(lines) if i not in fmt)
     return [lines[i].strip() for i in sorted(fmt)], body
@@ -307,6 +460,84 @@ def format_recall(draft, out):
         if not ux:
             hit += 1; continue
         if any(_contain(ux, u) >= 0.8 for u in ou):
+            hit += 1
+    return hit / len(fd)
+
+
+_KIND = (
+    ('subject', re.compile(r'^\s*(?:subject|re|fw|fwd|to|from|cc|date|主题|收件人|发件人)\s*[:：]', re.I)),
+    ('title', re.compile(r'^\s*#{1,6}\s')),
+    ('greeting', re.compile(r'^\s*(?:dear|hi|hello|hey|good (?:morning|afternoon|evening)|尊敬的|亲爱的|各位|敬爱的)\b', re.I)),
+    ('greeting', re.compile(r'^[^\s,，:：]{1,12}(?:老师|教授|同学|先生|女士|经理|总|博士|主任|导师|您好)[:：,，]?\s*$')),
+    ('signoff', re.compile(r'^\s*(?:best regards|best wishes|best|sincerely(?: yours)?|kind regards|warm regards|warmly|regards|cheers|many thanks|thanks again|thanks|thank you|yours(?: truly)?|respectfully|take care|talk soon|all the best)\s*[,!.]?\s*$', re.I)),
+    ('signoff', re.compile(r'^\s*(?:此致|敬礼|祝好|祝安|顺祝|顺颂|谢谢|感谢|敬上|谨上|学生|申请人)[:：!！。,，]?\s*$')),
+)
+
+
+def fmt_kind(line):
+    """格式行的类别:subject / title / greeting / signoff / signature(含邮箱日期电话的落款行)/ other。"""
+    for k, rx in _KIND:
+        if rx.search(line or ''):
+            return k
+    if _SIG.search(line or ''):
+        return 'signature'
+    return 'other'
+
+
+def paragraphs(t):
+    return [x for x in re.split(r'\n\s*\n', (strip_markup(t) or '').strip()) if x.strip()]
+
+
+def para_kept(draft, out):
+    """草稿的分段是否被压平(GLM 判 format_kept 时抓得最多的一类:paragraph breaks collapsed into one block)。
+       草稿不足 2 段则 1.0;输出段数少于草稿则按比例下降。"""
+    nd = len(paragraphs(draft))
+    if nd < 2:
+        return 1.0
+    return round(min(1.0, len(paragraphs(out)) / nd), 3)
+
+
+def _shape(ln):
+    """结构行的形状。判"要素还在不在"用形状,不用措辞 —— 改写一个标题和删掉一个标题不是一回事。"""
+    if _SIG.search(ln or ''):
+        return 'signature'                       # 含邮箱/电话/日期:是事实,仍要求逐字
+    if _SIGNOFF.match(ln or ''):
+        return 'signoff'
+    if _GREET.match(ln or ''):
+        return 'greeting'
+    if (ln or '').startswith('#') or (_FIELD.match(ln or '') and len(ln or '') <= 80):
+        return 'header'
+    if _LIST.match(ln or ''):
+        return 'list'
+    if _RULE_LN.match(ln or '') or (ln or '').count('|') >= 2:
+        return 'table'
+    return 'other'
+
+
+def format_presence(draft, out):
+    """格式【要素】还在不在(不是逐字保没保住)。
+
+    09-11 立这个指标,是因为 format_recall 用词级包含 >=0.8 判命中,于是"主题行改写"和"主题行整行删除"同分。
+    09-13 的误报筛查发现它自己也留了同一个尾巴:类别落到 other 的要素仍走逐字包含 >=0.8,于是中文小标题、
+    Q:/A: 行、社交帖标题、tl;dr、列表项这些【GLM 明文允许改写】的东西,一改就判 0.00,和删掉同分 —— 20 条误报出在这里。
+    现在改成:除 signature(含邮箱/电话/日期,是事实)之外,一律按【形状存在性】判 ——
+    输出里还有同形状的行就算保住,措辞随便改。草稿没有结构行则 1.0。
+    """
+    _, fd = split_prose(draft)
+    fd = [x for x in fd if x.strip() and not re.fullmatch(r'#+|[-*_\s]{3,}|```|~~~', x.strip())]
+    if not fd:
+        return 1.0
+    ol = [ln.strip() for ln in (strip_markup(out) or '').split('\n') if ln.strip()]
+    _, so = split_prose(out)
+    shapes_out = set(_shape(x) for x in ol) | set(_shape(x) for x in so)
+    ou = [_units(ln) for ln in ol]
+    hit = 0
+    for x in fd:
+        k = _shape(x); ux = _units(x)
+        if k == 'signature':
+            if not ux or any(_contain(ux, u) >= 0.8 for u in ou):
+                hit += 1
+        elif k in shapes_out or (ux and any(_contain(ux, u) >= 0.5 for u in ou)):
             hit += 1
     return hit / len(fd)
 
@@ -344,20 +575,26 @@ def structure(draft, out):
 
 def all_metrics(draft, out, body_only=True):
     """全部指标。body_only=True(默认):先把主题行/称呼/落款/签名块从两边剥掉,只在正文上量照抄与结构(这些行必须逐字保留,
-       不该算"没改",也不该让删掉它们变成"改得深");格式要素单独给 format_recall。正文太短(<20 单位)时退回全文。"""
+       不该算"没改",也不该让删掉它们变成"改得深");格式要素单独给 format_recall。散文太少(<6 单位)时退回全文。"""
     d, o = draft, out
     fr = format_recall(draft, out)
     if body_only:
-        _, db = split_format(draft); _, ob = split_format(out)
-        if len(tokens(db)) >= 20 and len(tokens(ob)) >= 10:
+        db, ob = prose_lines(draft), prose_lines(out)      # 09-13:改用"只认散文"的口径,见 prose_lines 的注释
+        if len(tokens(db)) >= 6 and len(tokens(ob)) >= 6:  # 散文太少(纯表格/纯代码文档)才退回全文,保住"整篇照抄"能被抓
             d, o = db, ob
     m = structure(d, o)
     vo, vd = verbatim_pair(d, o)
     m.update({'copy_5gram': round(copy_5gram(d, o), 3), 'draft_coverage': round(draft_coverage(d, o), 3),
               'verbatim_out': round(vo, 3), 'verbatim_draft': round(vd, 3), 'lcs_content': round(lcs_content(d, o), 3),
-              'fact_recall': round(fact_recall(draft, out), 3), 'format_recall': round(fr, 3)})
+              'fact_recall': round(fact_recall(draft, out), 3), 'format_recall': round(fr, 3),
+              'format_presence': round(format_presence(draft, out), 3), 'para_kept': para_kept(draft, out)})
+    fc, fd_ = extractive_fragments(d, o)
+    m['frag_coverage'] = round(fc, 3); m['frag_density'] = round(fd_, 2)   # 诊断用,见 extractive_fragments
     m['verbatim_sent'] = max(m['verbatim_out'], m['verbatim_draft'])
     m['copy'] = round(max(m['copy_5gram'], m['draft_coverage'], m['verbatim_out'], m['verbatim_draft']), 3)
+    sk = skeleton_recall(d, o)
+    m['skeleton_recall'] = None if sk is None else round(sk, 3)
+    m['reuse'] = round(m['copy'] if sk is None else max(m['copy'], sk), 3)
     return m
 
 
