@@ -117,7 +117,10 @@
   function renderFacts(fresh) {
     var panel = $('#facts-panel'), list = $('#facts-list'), cnt = $('#facts-count');
     if (!panel || !list) return;
-    panel.hidden = !facts.length;
+    // shown whenever the draft has text: with no facts yet it explains how to add one
+    panel.hidden = !facts.length && !draftValue().trim();
+    var hint = $('#facts-hint');
+    if (hint) hint.hidden = facts.length > 0;
     if (cnt) cnt.textContent = facts.length > 1 ? String(facts.length) : '';
     list.textContent = '';
     facts.forEach(function (f, i) {
@@ -350,9 +353,9 @@
 
   document.addEventListener('input', function (e) {
     if (e.target && e.target.closest && e.target.closest('#draft')) {
-      var n = facts.length;
+      var n = facts.length, shown = !$('#facts-panel').hidden;
       pruneFacts();
-      if (facts.length !== n) renderFacts();
+      if (facts.length !== n || shown !== !!draftValue().trim()) renderFacts();
       updateCount();
       updatePop();
     }

@@ -138,6 +138,8 @@ def draft_foot(examples) -> str:
         "长文档改写可能出现事实偏差，建议检查结果，或让 AI 把改错的地方纠正一下。")}</span></p>
 <div class="factbar" id="facts-panel" hidden>
   <span class="factbar-label" data-title-en="{html.escape(FACT_HELP['en'])}" data-title-zh="{html.escape(FACT_HELP['zh'])}">{icon("lock")}{L("Facts", "原样保留")}<span class="factbar-count mono" id="facts-count"></span></span>
+  <p class="factbar-hint" id="facts-hint">{L("Select a name, number, quote or term in the draft and click Create fact: it comes back word for word.",
+      "在草稿里选中名字、数字、引文或术语，点「原样保留」，改写时一字不改。")}</p>
   <ul class="factbar-list" id="facts-list"></ul>
 </div>
 <div class="sheet-foot">

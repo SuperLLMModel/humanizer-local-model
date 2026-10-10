@@ -127,34 +127,61 @@ function cleanup(ops, A, B) {
   return ops;
 }
 
-/**
- * 把 token 渲染进容器;marks 命中的内容 token 包进 <span class=cls>。
- * 相邻两个被标记的词之间的空格一起标(看起来像一笔划过去),换行不标。
- */
-export function renderMarked(el, tokens, marks, cls) {
-  const frag = document.createDocumentFragment();
-  let buf = '', span = null;
-  const flushText = () => { if (buf) { frag.append(buf); buf = ''; } };
-  const isMarked = (k) => {
-    const tk = tokens[k];
-    if (!tk.ws) return !!marks[tk.ci];
-    if (tk.t.includes('\n')) return false;
-    let p = k - 1, q = k + 1;
-    while (p >= 0 && tokens[p].ws) p--;
-    while (q < tokens.length && tokens[q].ws) q++;
-    return p >= 0 && q < tokens.length && !!marks[tokens[p].ci] && !!marks[tokens[q].ci];
-  };
+// 改动标记落到逐字符的标记位上(UTF-16 下标,和字符串一一对应)。
+// 相邻两个被标记的词之间的空格一起标(看起来像一笔划过去),换行不标。
+export function markBits(tokens, marks, bits, bit) {
+  let pos = 0;
   for (let k = 0; k < tokens.length; k++) {
-    if (isMarked(k)) {
-      if (!span) { flushText(); span = document.createElement('span'); span.className = cls; frag.append(span); }
-      span.append(tokens[k].t);
-    } else {
-      span = null;
-      buf += tokens[k].t;
+    const tk = tokens[k];
+    let on;
+    if (!tk.ws) on = !!marks[tk.ci];
+    else if (tk.t.includes('\n')) on = false;
+    else {
+      let p = k - 1, q = k + 1;
+      while (p >= 0 && tokens[p].ws) p--;
+      while (q < tokens.length && tokens[q].ws) q++;
+      on = p >= 0 && q < tokens.length && !!marks[tokens[p].ci] && !!marks[tokens[q].ci];
+    }
+    if (on) for (let i = pos; i < pos + tk.t.length; i++) bits[i] |= bit;
+    pos += tk.t.length;
+  }
+  return bits;
+}
+
+/** 「原样保留」的文字在 text 里每一处出现都标上 bit。 */
+export function factBits(text, facts, bits, bit) {
+  for (const f of facts || []) {
+    if (!f) continue;
+    for (let s = text.indexOf(f); s >= 0; s = text.indexOf(f, s + 1)) {
+      for (let i = s; i < s + f.length; i++) bits[i] |= bit;
     }
   }
-  flushText();
+  return bits;
+}
+
+/** 按标记位分段渲染:标记位相同的连续字符放进一个 span,classes[j] 对应第 j 位。 */
+export function renderRuns(el, text, bits, classes) {
+  const frag = document.createDocumentFragment();
+  let start = 0;
+  for (let i = 1; i <= text.length; i++) {
+    if (i < text.length && (bits[i] || 0) === (bits[start] || 0)) continue;
+    const seg = text.slice(start, i), b = bits[start] || 0;
+    if (!b) frag.append(seg);
+    else {
+      const span = document.createElement('span');
+      span.className = classes.filter((_, j) => b & (1 << j)).join(' ');
+      span.textContent = seg;
+      frag.append(span);
+    }
+    start = i;
+  }
   el.replaceChildren(frag);
+}
+
+/** 把 token 渲染进容器;marks 命中的内容 token 包进 <span class=cls>。 */
+export function renderMarked(el, tokens, marks, cls) {
+  const text = tokens.map((tk) => tk.t).join('');
+  renderRuns(el, text, markBits(tokens, marks, new Uint8Array(text.length), 1), [cls]);
 }
 
 /** 在已渲染的草稿里给指定数字加虚线框(数字核对用)。 */

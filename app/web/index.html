@@ -161,8 +161,8 @@
         <span class="meta mono" id="draft-count"></span>
       </header>
       <div class="sheet-body">
+        <div class="textview" id="draft-marks" aria-hidden="true"></div>
         <textarea id="draft" spellcheck="false" data-i18n-attr="placeholder:draft.placeholder;aria-label:draft.title"></textarea>
-        <div class="textview" id="draft-view" hidden></div>
         <div class="samples" id="samples" hidden>
           <span data-i18n="draft.try">没有草稿？试试示例</span>
           <span id="sample-btns"></span>
@@ -177,6 +177,7 @@
       <p class="draft-note" id="draft-long" role="note" hidden><svg aria-hidden="true"><use href="#i-info"/></svg><span data-i18n="draft.long">长文档改写可能出现事实偏差，建议检查结果，或让 AI 把改错的地方纠正一下。</span></p>
       <div class="factbar" id="facts-panel" hidden>
         <span class="factbar-label" data-i18n-attr="title:facts.help"><svg aria-hidden="true"><use href="#i-lock"/></svg><span data-i18n="facts.title">原样保留</span><span class="factbar-count mono" id="facts-count"></span></span>
+        <p class="factbar-hint" id="facts-hint" data-i18n="facts.hint">在草稿里选中名字、数字、引文或术语，点「原样保留」，改写时一字不改。</p>
         <ul class="factbar-list" id="facts-list" data-i18n-attr="aria-label:facts.title"></ul>
       </div>
       <footer class="sheet-foot">
@@ -184,8 +185,8 @@
         <button class="tool" id="btn-paste" type="button"><svg><use href="#i-paste"/></svg><span data-i18n="draft.paste">粘贴</span></button>
         <button class="tool" id="btn-upload" type="button" data-i18n-attr="title:draft.uploadHelp"><svg><use href="#i-import"/></svg><span data-i18n="draft.upload">导入</span></button>
         <button class="tool" id="btn-clear" type="button"><svg><use href="#i-eraser"/></svg><span data-i18n="draft.clear">清空</span></button>
-        <button class="tool" id="btn-edit" type="button" hidden><span data-i18n="draft.edit">回到编辑</span></button>
         <span class="grow"></span>
+        <span class="legend" id="legend-fact" hidden><i class="sw fact-sw"></i><span data-i18n="facts.title">原样保留</span></span>
         <span class="legend" id="legend-del" hidden><i class="sw del-sw"></i><span data-i18n="diff.removed">被改掉的</span></span>
       </footer>
     </article>
@@ -219,6 +220,7 @@
       </div>
       <footer class="sheet-foot">
         <button class="chip" id="chip-numbers" type="button" hidden></button>
+        <span class="legend" id="out-facts" hidden><i class="sw fact-sw"></i><span id="out-facts-text"></span></span>
         <span class="mono dim small stats" id="out-stats"></span>
         <span class="grow"></span>
         <button class="tool" id="btn-regen" type="button" disabled><svg><use href="#i-redo"/></svg><span data-i18n="out.regen">重新生成</span></button>

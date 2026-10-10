@@ -3,7 +3,7 @@ import { t, apply, setLang, getLang } from './i18n.js';
 import { getJSON, postJSON, countTokens, streamCompletion } from './api.js';
 import { buildPrompt, selfCheck, nPredictFor } from './prompt.js';
 import { withLangGuard, langDrift } from './guard.js';
-import { tokenize, diffTokens, renderMarked, flagNumbers } from './diff.js';
+import { tokenize, diffTokens, markBits, factBits, renderRuns, flagNumbers } from './diff.js';
 import { countText, isMostlyCJK, isLongDraft, numberCheck, fmtBytes, fmtDuration, fmtNum, escapeHTML, pyStrip } from './text.js';
 import { loadHistory, addHistory, removeHistory, clearHistory, store } from './history.js';
 import { SAMPLES } from './samples.js';
@@ -31,7 +31,6 @@ const S = {
   facts: [],
   result: null,
   showDiff: store.get('diff', '1') === '1',
-  editing: true,
   fails: 0,
   quit: false,
   autoRun: params.get('run') === '1',
@@ -379,6 +378,7 @@ function onDraftInput(save = true) {
   $('samples').hidden = v.trim() !== '';
   $('draft-long').hidden = !isLongDraft(v);
   $('draft').classList.toggle('cjk', isMostlyCJK(v));
+  renderDraftMarks();
   updateGo();
   if (save) {
     clearTimeout(saveTimer);
@@ -412,14 +412,28 @@ function showNotice(kind, html) {
   n.hidden = false;
 }
 
-function setEditing(on) {
-  S.editing = on;
-  $('draft').hidden = !on;
-  $('draft-view').hidden = on;
-  $('btn-edit').hidden = on;
-  $('legend-del').hidden = on;
-  updateFactSelection();
-  if (on) requestAnimationFrame(() => $('draft').focus({ preventScroll: true }));
+// 草稿框一直能改:原样保留的文字和「被改掉的」(草稿还是上次改写用的那篇时)画在草稿框底下的标记层里。
+function renderDraftMarks() {
+  const ta = $('draft'), el = $('draft-marks');
+  const text = ta.value, r = S.result;
+  const showDel = !!(S.showDiff && r && r.diff && text === r.draft);
+  const bits = new Uint8Array(text.length);
+  if (showDel) markBits(r.aTok, r.diff.a, bits, 1);
+  factBits(text, S.facts, bits, 2);
+  renderRuns(el, text + '\n\u200b', bits, ['del', 'fact']); // 末尾多垫一行,标记层不会比草稿框矮、滚到底也对得上
+  if (showDel) flagNumbers(el, r.nums.missing);
+  el.className = 'textview' + (ta.classList.contains('cjk') ? ' cjk' : '');
+  $('legend-del').hidden = !showDel;
+  $('legend-fact').hidden = !S.facts.length;
+  syncDraftMarks();
+}
+
+function syncDraftMarks() {
+  const ta = $('draft'), el = $('draft-marks');
+  el.style.width = ta.clientWidth + 'px';
+  el.style.height = ta.clientHeight + 'px';
+  el.scrollTop = ta.scrollTop;
+  el.scrollLeft = ta.scrollLeft;
 }
 
 function maybeAutoRun() {
@@ -461,13 +475,14 @@ async function run() {
   const protectedDraft = protectFacts(draft, S.facts);
   togglePop(false);
   closeNumbers();
-  setEditing(true);
   S.running = true;
   S.abort = new AbortController();
   S.out = '';
   S.result = null;
+  renderDraftMarks();
   $('out-notice').hidden = true;
   $('chip-numbers').hidden = true;
+  $('out-facts').hidden = true;
   $('out-stats').textContent = '';
   $('out-count').textContent = '';
   $('out-empty').hidden = true;
@@ -571,7 +586,7 @@ async function run() {
     if (aborted) showNotice('', t('out.stopped'));
     else if (factsLost) showNotice('warn', t('facts.failed', { n: FACT_TRIES }));
   } else {
-    S.result = makeResult(draft, text);
+    S.result = makeResult(draft, text, protectedDraft.facts);
     if (final) {
       const tok = final.tokens_predicted || 0;
       const tps = final.timings?.predicted_per_second;
@@ -598,10 +613,10 @@ function stop() {
   if (S.abort) S.abort.abort();
 }
 
-function makeResult(draft, out) {
+function makeResult(draft, out, facts = []) {
   const aTok = tokenize(draft), bTok = tokenize(out);
   const diff = diffTokens(aTok, bTok);
-  return { draft, out, aTok, bTok, diff, nums: numberCheck(draft, out) };
+  return { draft, out, aTok, bTok, diff, nums: numberCheck(draft, out), facts: facts.filter((f) => out.includes(f)) };
 }
 
 function renderResult() {
@@ -610,26 +625,21 @@ function renderResult() {
   const out = $('output');
   out.classList.toggle('cjk', isMostlyCJK(r.out));
   $('out-empty').hidden = true;
-  const useDiff = S.showDiff && r.diff;
-  if (useDiff) renderMarked(out, r.bTok, r.diff.b, 'ins');
-  else out.textContent = r.out;
-
-  // 草稿侧:显示被改掉的部分(只在草稿没被改过时)
-  if (useDiff && $('draft').value === r.draft) {
-    const v = $('draft-view');
-    v.classList.toggle('cjk', isMostlyCJK(r.draft));
-    renderMarked(v, r.aTok, r.diff.a, 'del');
-    flagNumbers(v, r.nums.missing);
-    setEditing(false);
-  } else if (!S.editing) {
-    setEditing(true);
-  }
+  // 改写侧:新写的词(显示改动时)+ 原样保留的文字;草稿侧的「被改掉的」在 renderDraftMarks 里画
+  const bits = new Uint8Array(r.out.length);
+  if (S.showDiff && r.diff) markBits(r.bTok, r.diff.b, bits, 1);
+  factBits(r.out, r.facts, bits, 2);
+  renderRuns(out, r.out, bits, ['ins', 'fact']);
+  renderDraftMarks();
   if (S.showDiff && !r.diff) showNotice('', t('diff.tooBig'));
 
   const c = countText(r.out);
   let meta = t('count.zh', { n: fmtNum(c.units, getLang()) });
   if (r.diff) meta += ' · ' + t('out.changed', { p: Math.round(r.diff.ratio * 100) });
   $('out-count').innerHTML = meta;
+
+  $('out-facts').hidden = !r.facts.length;
+  $('out-facts-text').textContent = t('facts.kept', { n: r.facts.length });
 
   const chip = $('chip-numbers');
   if (r.nums.total) {
@@ -717,7 +727,7 @@ function restore(h) {
   onDraftInput();
   $('out-notice').hidden = true;
   $('out-stats').textContent = h.tok ? `${fmtNum(h.tok, getLang())} tokens` + (h.tps ? ` · ${h.tps.toFixed(1)} tok/s` : '') : '';
-  S.result = makeResult(h.draft, h.out);
+  S.result = makeResult(h.draft, h.out, h.facts || []);
   renderResult();
   openDrawer(false);
   toast(t('history.restored'));
@@ -804,7 +814,6 @@ async function importDocument(file) {
     if (S.running || $('draft').value !== original) { toast(t('draft.uploadChanged'), 'err'); return; }
     $('draft').value = result.text;
     S.facts = [];
-    setEditing(true);
     onDraftInput();
     store.set('draft', result.text);
     $('draft').scrollTop = 0;
@@ -850,7 +859,7 @@ function bindDrop() {
 // ───────────────────────── Create fact:选中的文字改写时一字不改 ─────────────────────────
 function selectedFact() {
   const draft = $('draft');
-  return S.editing && !S.running ? draft.value.slice(draft.selectionStart, draft.selectionEnd).trim() : '';
+  return S.running ? '' : draft.value.slice(draft.selectionStart, draft.selectionEnd).trim();
 }
 
 // 选区在草稿框里的坐标:用一个同样排版的隐藏镜像算(textarea 不给选区坐标)
@@ -899,7 +908,9 @@ function updateFactSelection() {
 }
 
 function renderFacts(fresh = '') {
-  $('facts-panel').hidden = !S.facts.length;
+  // 草稿有字就常驻这一条:没保留任何文字时显示用法提示,让人知道有这个功能
+  $('facts-panel').hidden = !S.facts.length && !pyStrip($('draft').value);
+  $('facts-hint').hidden = S.facts.length > 0;
   $('facts-count').textContent = S.facts.length > 1 ? String(S.facts.length) : '';
   $('facts-list').replaceChildren(...S.facts.map((fact) => {
     const li = document.createElement('li');
@@ -908,6 +919,8 @@ function renderFacts(fresh = '') {
     const text = document.createElement('span');
     text.className = 'fact-text';
     text.textContent = fact.replace(/\s+/g, ' ');
+    text.title = t('facts.jump');
+    text.addEventListener('click', () => jumpToFact(fact));
     const remove = document.createElement('button');
     remove.type = 'button';
     remove.className = 'fact-x';
@@ -924,6 +937,18 @@ function renderFacts(fresh = '') {
     li.append(text, remove);
     return li;
   }));
+  renderDraftMarks();
+}
+
+// 点标签:在草稿里选中这段并滚到它
+function jumpToFact(fact) {
+  const ta = $('draft'), at = ta.value.indexOf(fact);
+  if (at < 0) return;
+  ta.focus({ preventScroll: true });
+  ta.setSelectionRange(at, at + fact.length);
+  const y = ta.value.length < 60000 ? caretXY(ta, at).y + ta.scrollTop : 0;
+  ta.scrollTop = Math.max(0, y - ta.clientHeight / 3);
+  syncDraftMarks();
 }
 
 function bind() {
@@ -936,7 +961,8 @@ function bind() {
   bindDrop();
   for (const event of ['select', 'keyup', 'mouseup', 'focus']) $('draft').addEventListener(event, updateFactSelection);
   document.addEventListener('selectionchange', updateFactSelection);
-  $('draft').addEventListener('scroll', () => { if (!$('btn-create-fact').hidden) placeFactPop(); });
+  $('draft').addEventListener('scroll', () => { syncDraftMarks(); if (!$('btn-create-fact').hidden) placeFactPop(); });
+  new ResizeObserver(syncDraftMarks).observe($('draft'));
   $('draft').addEventListener('blur', (e) => { if (e.relatedTarget !== $('btn-create-fact')) $('btn-create-fact').hidden = true; });
   window.addEventListener('resize', () => { if (!$('btn-create-fact').hidden) placeFactPop(); });
   // 点按钮时别让草稿框先丢掉选区
@@ -956,8 +982,6 @@ function bind() {
     toast(t('facts.created'), 'ok');
   });
   $('draft').addEventListener('input', () => onDraftInput());
-  $('draft-view').addEventListener('click', () => setEditing(true));
-  $('btn-edit').addEventListener('click', () => setEditing(true));
   $('btn-go').addEventListener('click', run);
   $('btn-regen').addEventListener('click', run);
   $('btn-copy').addEventListener('click', copyOut);
@@ -965,15 +989,15 @@ function bind() {
   $('chip-numbers').addEventListener('click', (e) => { e.stopPropagation(); $('numbers-pop').hidden ? openNumbers() : closeNumbers(); });
   $('btn-clear').addEventListener('click', () => {
     $('draft').value = '';
-    setEditing(true);
     onDraftInput();
+    $('draft').focus();
   });
   $('btn-paste').addEventListener('click', async () => {
     try {
       const txt = await navigator.clipboard.readText();
-      if (txt) { $('draft').value = txt; S.facts = []; setEditing(true); onDraftInput(); }
+      if (txt) { $('draft').value = txt; S.facts = []; onDraftInput(); }
     } catch {
-      setEditing(true);
+      $('draft').focus();
       toast(IS_MAC ? '⌘ V' : 'Ctrl V');
     }
   });
