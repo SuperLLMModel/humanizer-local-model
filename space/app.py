@@ -101,6 +101,72 @@ if not MOCK:
 
     def count_tokens(text: str) -> int:
         return len(tokenizer(text)["input_ids"])
+
+    # Fast decoding (fastgen.py): the decode step is compiled ahead of time with AOTInductor, once, and kept
+    # in a private model repo; every ZeroGPU worker just loads it (about a second) instead of recompiling.
+    # Prefill and sampling are unchanged. HUMANIZER_FAST=off, a missing package or any load error falls back
+    # to plain model.generate.
+    import fastgen  # noqa: E402
+
+    FAST = os.environ.get("HUMANIZER_FAST", "aoti")
+    AOTI_REPO = os.environ.get("HUMANIZER_AOTI_REPO", "jialinyyzz/humanizer-aoti")
+    AOTI_PACKAGE = None
+    AOTI_INFO: dict = {}
+
+    @spaces.GPU(duration=1500)   # startup only: the longest ZeroGPU allows for compiling at startup
+    def _aoti_compile(path: str) -> dict:
+        return fastgen.compile_package(model, path)
+
+    def _aoti_prepare():
+        from huggingface_hub import HfApi
+
+        name = fastgen.package_name(model)
+        try:
+            return hf_hub_download(AOTI_REPO, name), {"source": "hub", "name": name}
+        except Exception as exc:
+            print(f"[fast] no package {name} in {AOTI_REPO} ({type(exc).__name__}); compiling", flush=True)
+        local = HERE / ".aoti" / name
+        local.parent.mkdir(exist_ok=True)
+        t0 = time.time()
+        info = _aoti_compile(str(local))
+        info |= {"source": "compiled", "name": name, "startup_call_s": round(time.time() - t0, 1)}
+        try:  # needs a write token in the Space secret HF_TOKEN; without one the next restart compiles again
+            api = HfApi()
+            api.create_repo(AOTI_REPO, repo_type="model", private=True, exist_ok=True)
+            api.upload_file(path_or_fileobj=str(local), path_in_repo=name, repo_id=AOTI_REPO,
+                            commit_message=f"AOTI decode step {name}")
+            info["uploaded"] = True
+        except Exception as exc:
+            print(f"[fast] upload failed: {exc}", flush=True)
+        return str(local), info
+
+    if FAST == "aoti":
+        try:
+            AOTI_PACKAGE, AOTI_INFO = _aoti_prepare()
+            print(f"[fast] AOTI decode step ready: {AOTI_INFO}", flush=True)
+        except Exception as exc:  # never let the speed-up keep the demo from starting
+            AOTI_PACKAGE, AOTI_INFO = None, {"error": f"{type(exc).__name__}: {exc}"}
+            print(f"[fast] disabled, plain generate: {AOTI_INFO['error']}", flush=True)
+    _AOTI_WORKER = fastgen.AotiWorker()
+    _SAMPLERS: dict = {}
+
+    def _fast_engine(n_prompt: int, max_new: int):
+        """(step, step_fn, sampler) in this GPU worker, or None to use plain generate."""
+        if not AOTI_PACKAGE or n_prompt + max_new > fastgen.MAX_LEN:
+            return None
+        try:
+            step, fn, load_s = _AOTI_WORKER.get(model, AOTI_PACKAGE)
+            if load_s:
+                print(f"[fast] loaded AOTI step in pid {os.getpid()} ({load_s:.1f} s)", flush=True)
+            if os.getpid() not in _SAMPLERS:
+                _SAMPLERS.clear()
+                _SAMPLERS[os.getpid()] = fastgen.Sampler(model.config.get_text_config().vocab_size, model.device,
+                                                         suppress=model.generation_config.suppress_tokens or (),
+                                                         top_p=0.95)
+            return step, fn, _SAMPLERS[os.getpid()]
+        except Exception as exc:
+            print(f"[fast] AOTI unavailable in this worker, plain generate: {type(exc).__name__}: {exc}", flush=True)
+            return None
 else:
     def count_tokens(text: str) -> int:
         return int(hz_text.latin_words(text) * 1.15 + hz_text.cjk_chars(text) * 0.62) + 1
@@ -135,15 +201,42 @@ if not MOCK:
         streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True,
                                         timeout=budget + 30)
         box, flag = {}, threading.Event()
+        n_prompt = enc["input_ids"].shape[1]
+        fast = _fast_engine(n_prompt, max_new)
+
+        def plain():
+            ids = model.generate(
+                **enc, streamer=streamer, max_new_tokens=max_new, max_time=budget,
+                do_sample=True, temperature=1.0, top_p=0.95, top_k=0, repetition_penalty=1.0,
+                pad_token_id=tokenizer.pad_token_id, eos_token_id=EOS,
+                stopping_criteria=StoppingCriteriaList([_StopWhenSet(flag)]))
+            box["new"] = ids[0, n_prompt:].tolist()
 
         def work():
             try:
                 with torch.inference_mode():
-                    box["ids"] = model.generate(
-                        **enc, streamer=streamer, max_new_tokens=max_new, max_time=budget,
-                        do_sample=True, temperature=1.0, top_p=0.95, top_k=0, repetition_penalty=1.0,
-                        pad_token_id=tokenizer.pad_token_id, eos_token_id=EOS,
-                        stopping_criteria=StoppingCriteriaList([_StopWhenSet(flag)]))
+                    if fast is None:
+                        plain()
+                        return
+                    step, fn, sampler = fast
+                    streamer.put(enc["input_ids"].cpu())          # skip_prompt drops this first put, as in generate
+                    sent = []
+
+                    def emit(t):
+                        sent.append(t)
+                        streamer.put(torch.tensor([t]))
+                    try:
+                        box["new"], _ = fastgen.generate(model, step, fn, enc["input_ids"], max_new=max_new,
+                                                         eos=EOS, sampler=sampler, max_time=budget,
+                                                         stop_flag=flag, on_token=emit)
+                    except Exception as exc:
+                        if sent:
+                            raise
+                        print(f"[fast] failed before the first token, plain generate: {exc}", flush=True)
+                        streamer.next_tokens_are_prompt = True
+                        plain()
+                        return
+                    streamer.end()
             except Exception as exc:  # surface it instead of hanging the streamer
                 box["err"] = f"{type(exc).__name__}: {exc}"
                 streamer.end()
@@ -164,10 +257,10 @@ if not MOCK:
         if "err" in box:
             yield ("error", box["err"])
             return
-        new = box["ids"][0, enc["input_ids"].shape[1]:]
-        n = int(new.shape[0])
+        new = box["new"]
+        n = len(new)
         yield ("done", {"tokens": n, "eos": n > 0 and int(new[-1]) == EOS and not flag.is_set(),
-                        "gen_seconds": time.time() - t0})
+                        "gen_seconds": time.time() - t0, "fast": fast is not None})
 else:
     _mock_seen: dict = {}
 
