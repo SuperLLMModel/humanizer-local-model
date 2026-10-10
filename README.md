@@ -14,7 +14,7 @@
 
 **humanizer** is a 12B model that rewrites AI-written drafts (emails, essays, reports, forum posts; English and Chinese) so they read like a person wrote them. It is trained to keep every number, unit, date, name and quote and to add nothing, and it runs on your own computer.
 
-**Quick start:** get the app for **[Mac (Apple silicon)](https://github.com/sgaofen/humanizer-local-model/releases/download/app-v0.3.2/Humanizer-0.3.2-macos-arm64.dmg)** or **[Windows](https://github.com/sgaofen/humanizer-local-model/releases/download/app-v0.3.2/Humanizer-0.3.2-windows-x64-setup.exe)**, open it and paste a draft; it works offline. Without the app: [one llama.cpp command](#option-2-one-command-llamacpp), or [AGENTS.md](AGENTS.md) for coding agents.
+**Quick start:** get the app for **[Mac (Apple silicon)](https://github.com/sgaofen/humanizer-local-model/releases/download/app-v0.3.3/Humanizer-0.3.3-macos-arm64.dmg)** or **[Windows](https://github.com/sgaofen/humanizer-local-model/releases/download/app-v0.3.3/Humanizer-0.3.3-windows-x64-setup.exe)**, open it and paste a draft; it works offline. Without the app: [one llama.cpp command](#option-2-one-command-llamacpp), or [AGENTS.md](AGENTS.md) for coding agents.
 
 ## Before and after
 
@@ -59,16 +59,16 @@ Most GGUF files come from one `llama-quantize` pass that rounds every weight to 
 
 | Your computer | Download |
 |---|---|
-| **Mac** with Apple silicon (M1 or newer) | [`Humanizer-0.3.2-macos-arm64.dmg`](https://github.com/sgaofen/humanizer-local-model/releases/download/app-v0.3.2/Humanizer-0.3.2-macos-arm64.dmg), or the newest from **[Releases](https://github.com/sgaofen/humanizer-local-model/releases/latest)** |
-| **Windows** (x64) | [`Humanizer-0.3.2-windows-x64-setup.exe`](https://github.com/sgaofen/humanizer-local-model/releases/download/app-v0.3.2/Humanizer-0.3.2-windows-x64-setup.exe) (or the portable [`.zip`](https://github.com/sgaofen/humanizer-local-model/releases/download/app-v0.3.2/Humanizer-0.3.2-windows-x64-portable.zip)), or the newest from **[Releases](https://github.com/sgaofen/humanizer-local-model/releases/latest)** |
+| **Mac** with Apple silicon (M1 or newer) | [`Humanizer-0.3.3-macos-arm64.dmg`](https://github.com/sgaofen/humanizer-local-model/releases/download/app-v0.3.3/Humanizer-0.3.3-macos-arm64.dmg), or the newest from **[Releases](https://github.com/sgaofen/humanizer-local-model/releases/latest)** |
+| **Windows** (x64) | [`Humanizer-0.3.3-windows-x64-setup.exe`](https://github.com/sgaofen/humanizer-local-model/releases/download/app-v0.3.3/Humanizer-0.3.3-windows-x64-setup.exe) (or the portable [`.zip`](https://github.com/sgaofen/humanizer-local-model/releases/download/app-v0.3.3/Humanizer-0.3.3-windows-x64-portable.zip)), or the newest from **[Releases](https://github.com/sgaofen/humanizer-local-model/releases/latest)** |
 
 Double-click it and the app opens in your browser. On first run it looks at your memory, suggests a model size and downloads it once from Hugging Face. After that it works offline. Paste a draft on the left; the rewrite streams in on the right, with new wording highlighted and replaced wording struck through. On an M5 Max a hundred-word email takes about 3.6 seconds.
 
-New in 0.3.2: import the text of a Word (`.docx`) or PDF file, and select any passage in the draft and click **Create fact** to keep it word for word in the rewrite (thanks to [@meharrkapoorr](https://github.com/meharrkapoorr) for both).
+New in 0.3.2: import the text of a Word (`.docx`) or PDF file, and select any passage in the draft and click **Create fact** to keep it word for word in the rewrite (thanks to [@meharrkapoorr](https://github.com/meharrkapoorr) for both). 0.3.3: kept passages are highlighted in the draft and the rewrite, and the draft stays editable after a rewrite, so you can change it and run again.
 
 The app offers five sizes: Q8_0 (best), Q6_K (no measurable loss), Q4_K_M (slight loss), Q3 (small loss; a few more fact slips in English) and 2-bit (lowest AI-detector score; a few more fact slips). It suggests one for your memory, down to 8 GB machines; switch any time from the **…** menu → **Change model size**. Details: [which model size](docs/INSTALL.md#which-model-size).
 
-**Updates:** the app checks GitHub and Hugging Face once a day (you can turn that off) and shows a small hint in the top bar when a new version or a newer model file is out. **…** → **Check for updates** shows what changed and updates in one click; your model, settings and history stay. Checking for updates works from 0.3.2 on; 0.3.1 and earlier need one manual update (download 0.3.2 above and install it over the old app). Details: [updates](docs/INSTALL.md#updates).
+**Updates:** the app checks GitHub and Hugging Face once a day (you can turn that off) and shows a small hint in the top bar when a new version or a newer model file is out. **…** → **Check for updates** shows what changed and updates in one click; your model, settings and history stay. Checking for updates works from 0.3.2 on; 0.3.1 and earlier need one manual update (download the version above and install it over the old app). Details: [updates](docs/INSTALL.md#updates).
 
 The app is not code-signed yet, so macOS and Windows will warn you the first time. The one-time fix is in [docs/INSTALL.md](docs/INSTALL.md#first-launch-warnings).
 
