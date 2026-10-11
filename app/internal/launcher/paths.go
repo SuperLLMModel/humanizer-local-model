@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"unicode/utf16"
 )
 
 // defaultDataDir:Mac ~/Library/Application Support/Humanizer,
@@ -30,11 +31,14 @@ func defaultDataDir() string {
 	}
 }
 
-// pointerName:默认数据目录里的一个很小的文件,记着用户在网页上把存储位置改到了哪儿。
-// 它放在默认目录里,所以数据目录整个换掉、甚至搬走了,下次启动照样找得到设置。
+// pointerName:一个很小的文件,记着用户在网页上把存储位置改到了哪儿。
+// 平时放在默认数据目录里,所以运行目录整个换掉、甚至搬走了,下次启动照样找得到;
+// 运行目录被 --data-dir 钉死时放在那个目录里,只记模型目录。
+// Windows 卸载程序也读它(humanizer.iss),所以只用 ASCII 写(见 locationJSON)。
 const pointerName = "location.json"
 
 // location 只存路径,别的一概不放:这样数据目录丢了还能靠它找回来。
+// 字段为空 = 那一项用默认位置。
 type location struct {
 	DataDir  string `json:"data_dir,omitempty"`
 	ModelDir string `json:"model_dir,omitempty"`
@@ -44,53 +48,111 @@ type location struct {
 type startPaths struct {
 	DataDir     string // 这次运行的数据目录(设置、日志、更新包)
 	ModelDir    string // 网页上设过的模型目录;空 = 数据目录下的 models
-	PointerDir  string // location.json 放哪儿;被 --data-dir 钉死时为空
+	PointerDir  string // location.json 放哪儿
 	DataDirLock bool   // 运行目录由命令行/环境变量固定,网页上不让改
+	Note        string // 记下的运行目录用不了、退回默认时的说明(进启动日志)
 }
 
 // resolveStartPaths 定出这次的存储位置:
 // 命令行 --data-dir / 环境变量 > 默认目录里的 location.json > 默认目录。
+// 给了 explicit 时完全不看默认目录(开发、测试、便携用法不该被本机装的 App 影响)。
 func resolveStartPaths(explicit string) startPaths {
 	if strings.TrimSpace(explicit) != "" {
-		return startPaths{DataDir: absDir(explicit), DataDirLock: true}
+		dir := absDir(explicit)
+		sp := startPaths{DataDir: dir, PointerDir: dir, DataDirLock: true}
+		if loc, ok := readLocation(dir); ok {
+			sp.ModelDir = cleanRecorded(loc.ModelDir)
+		}
+		return sp
 	}
 	def := defaultDataDir()
 	sp := startPaths{DataDir: def, PointerDir: def}
-	if b, err := os.ReadFile(filepath.Join(def, pointerName)); err == nil {
-		var loc location
-		if json.Unmarshal(b, &loc) == nil {
-			// 运行目录存不存在都要管:盘拔了、目录被删了,回默认,别卡在一个用不了的位置上。
-			if loc.DataDir != "" && usableDir(loc.DataDir) {
-				sp.DataDir = absDir(loc.DataDir)
-			}
-			// 模型目录不要求已经存在(它下次下载时才建):这时悄悄回默认,
-			// 等于把几十 GB 的模型挪了个地方,不如照旧记着,等用户自己处理。
-			if strings.TrimSpace(loc.ModelDir) != "" {
-				sp.ModelDir = absDir(loc.ModelDir)
+	if loc, ok := readLocation(def); ok {
+		// 运行目录存不存在都要管:盘拔了、目录被删了,回默认,别卡在一个用不了的位置上。
+		if d := cleanRecorded(loc.DataDir); d != "" {
+			if usableDir(d) {
+				sp.DataDir = d
+			} else {
+				sp.Note = "记下的运行目录 " + d + " 现在用不了(盘没插或没有写权限),这次先用默认位置"
 			}
 		}
+		// 模型目录不要求已经存在(它下次下载时才建):这时悄悄回默认,
+		// 等于把几十 GB 的模型挪了个地方,不如照旧记着,等用户自己处理。
+		sp.ModelDir = cleanRecorded(loc.ModelDir)
 	}
 	return sp
 }
 
-// saveLocation 记下"存储位置搬到哪儿了";两个都回到默认就把这个文件删掉。
+func readLocation(dir string) (location, bool) {
+	var loc location
+	b, err := os.ReadFile(filepath.Join(dir, pointerName))
+	if err != nil || json.Unmarshal(b, &loc) != nil {
+		return location{}, false
+	}
+	return loc, true
+}
+
+// cleanRecorded:location.json 里只认绝对路径,相对路径(手改坏了)当没写。
+func cleanRecorded(p string) string {
+	p = strings.TrimSpace(p)
+	if p == "" || !filepath.IsAbs(p) {
+		return ""
+	}
+	return filepath.Clean(p)
+}
+
+// saveLocation 记下"存储位置搬到哪儿了"。dataDir 就是 pointerDir(默认位置或被钉死的目录)时不记,
+// 两项都是默认就把这个文件删掉。
 func saveLocation(pointerDir, dataDir, modelDir string) error {
 	if pointerDir == "" {
-		return nil // 运行目录被 --data-dir 钉死了,不用记
+		return nil
 	}
 	p := filepath.Join(pointerDir, pointerName)
-	def := defaultDataDir()
-	if samePath(dataDir, def) && modelDir == "" {
+	loc := location{ModelDir: modelDir}
+	if !samePath(dataDir, pointerDir) {
+		loc.DataDir = dataDir
+	}
+	if loc == (location{}) {
 		if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
 		return nil
 	}
-	b, err := json.MarshalIndent(location{DataDir: dataDir, ModelDir: modelDir}, "", "  ")
-	if err != nil {
-		return err
+	return writeFileAtomic(p, locationJSON(loc))
+}
+
+// locationJSON 写成纯 ASCII 的 JSON:非 ASCII 字符(中文路径)一律写成 \uXXXX。
+// Inno Setup 的卸载脚本按字节读文件、只会解这几种转义,中文直接写 UTF-8 会被它按本地代码页读成乱码。
+func locationJSON(loc location) []byte {
+	var kv [][2]string
+	if loc.DataDir != "" {
+		kv = append(kv, [2]string{"data_dir", loc.DataDir})
 	}
-	return writeFileAtomic(p, b)
+	if loc.ModelDir != "" {
+		kv = append(kv, [2]string{"model_dir", loc.ModelDir})
+	}
+	var b strings.Builder
+	b.WriteString("{")
+	for i, f := range kv {
+		if i > 0 {
+			b.WriteString(",")
+		}
+		b.WriteString("\n  \"" + f[0] + "\": \"")
+		for _, u := range utf16.Encode([]rune(f[1])) {
+			switch {
+			case u == '"' || u == '\\':
+				b.WriteByte('\\')
+				b.WriteByte(byte(u))
+			case u < 0x20 || u > 0x7e:
+				fmt.Fprintf(&b, `\u%04x`, u)
+			default:
+				b.WriteByte(byte(u))
+			}
+		}
+		b.WriteString("\"")
+	}
+	b.WriteString("\n}\n")
+	return []byte(b.String())
 }
 
 func absDir(p string) string {

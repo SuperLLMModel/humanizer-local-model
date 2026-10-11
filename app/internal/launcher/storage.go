@@ -52,8 +52,16 @@ func (a *App) pathsNow() (dataDir, modelsDir string) {
 
 // applyPaths 换存储位置。两个入参都空字符串 = 回到默认。
 // move 为真时把已经下载好的模型文件搬到新位置(跨盘符时是复制,可能要几分钟)。
+// 搬不过去(空间不够、写不进去)就整个作罢:已经挪过去的挪回来,位置不变,返回错误。
 // 换完按新位置重新判断开机状态:该下的重新下,该起的重新起。
 func (a *App) applyPaths(dataDir, modelDir string, move bool) (moved int, err error) {
+	if !a.pathsMu.TryLock() {
+		return 0, errors.New("上一次换位置还没做完,等它做完再试")
+	}
+	defer a.pathsMu.Unlock()
+	if a.updates != nil && a.updates.busy() {
+		return 0, errors.New("正在下载或安装更新,等更新做完(或暂停)再换位置")
+	}
 	curData, curModels := a.pathsNow()
 
 	wantData := curData
@@ -63,6 +71,9 @@ func (a *App) applyPaths(dataDir, modelDir string, move bool) (moved int, err er
 		}
 		p, err := cleanDir(s)
 		if err != nil {
+			return 0, err
+		}
+		if p, err = runDirFor(p); err != nil {
 			return 0, err
 		}
 		if err := os.MkdirAll(filepath.Join(p, "logs"), 0o755); err != nil {
@@ -83,87 +94,186 @@ func (a *App) applyPaths(dataDir, modelDir string, move bool) (moved int, err er
 		newModels = filepath.Join(wantData, "models")
 	}
 
-	// 先停下来:引擎正开着模型文件,Windows 上不关掉就搬不动。
+	// 先停下来:引擎正开着模型文件,Windows 上不关掉就搬不动;下载协程要等它把半截文件关掉。
 	// 手上正在改写的话等它写完,别把请求打断。
 	for waited := time.Duration(0); a.inflight.Load() > 0 && waited < 30*time.Second; waited += 200 * time.Millisecond {
 		time.Sleep(200 * time.Millisecond)
 	}
 	a.pauseDownload()
+	a.waitDownloadStopped()
 	a.stopEngine()
+	// 停了就一定要重新判断开机状态,失败了也一样(否则引擎停着、页面还显示就绪)
+	defer a.boot()
 	if move && !samePath(curModels, newModels) {
-		moved = a.moveModelFiles(curModels, newModels)
+		if moved, err = a.moveModelFiles(curModels, newModels); err != nil {
+			return 0, err
+		}
 	}
 
 	a.mu.Lock()
 	a.locModelDir = wantModels
-	if !samePath(wantData, a.dataDir) {
-		a.dataDir = wantData
-	}
+	a.dataDir = wantData
 	s := a.settings
-	dataDirNow, modelsDirNow := a.dataDir, a.modelDirLocked()
 	a.mu.Unlock()
 
-	if err := saveLocation(a.pointerDir, dataDirNow, wantModels); err != nil {
+	if err := saveLocation(a.pointerDir, wantData, wantModels); err != nil {
 		a.logf("记下存储位置失败:%v", err)
-	}
-	if err := os.MkdirAll(filepath.Join(dataDirNow, "logs"), 0o755); err != nil {
-		return moved, fmt.Errorf("建不了日志目录:%v", err)
 	}
 	// 设置跟着运行目录走:新目录里也写一份,档位、下载源、端口、开关都还在。
 	if err := saveSettings(a.settingsPath(), s); err != nil {
 		return moved, fmt.Errorf("保存设置失败:%v", err)
 	}
-	if !samePath(curData, dataDirNow) {
+	if !samePath(curData, wantData) {
 		if a.updates != nil {
-			a.updates.setDataDir(dataDirNow)
+			a.updates.setDataDir(wantData)
 		}
-		carryOverFile(filepath.Join(curData, "config.json"), filepath.Join(dataDirNow, "config.json"))
+		carryOverFile(filepath.Join(curData, "config.json"), filepath.Join(wantData, "config.json"))
 		_ = os.Remove(filepath.Join(curData, "instance.json"))
-		a.logf("运行目录改到 %s", dataDirNow)
+		a.logf("运行目录改到 %s,启动器日志从这里起写到新目录", wantData)
+		a.switchLauncherLog(wantData)
 	}
 	a.writeInstance()
-	a.logf("存储位置:运行目录 %s,模型目录 %s(搬了 %d 个文件)", dataDirNow, modelsDirNow, moved)
-	a.boot()
+	a.logf("存储位置:运行目录 %s,模型目录 %s(搬了 %d 个文件)", wantData, newModels, moved)
 	return moved, nil
 }
 
-// moveModelFiles 把 from 下的模型文件(含 .part 半截文件)搬到 to。
-// 搬不动的留在原地(比如权限问题),记一条日志。跨盘符 os.Rename 会失败,退化成复制。
-func (a *App) moveModelFiles(from, to string) int {
-	if from == "" || to == "" || samePath(from, to) {
-		return 0
+// runDirFor 决定选中的文件夹能不能直接当运行目录。
+// 运行目录里有 settings.json、config.json 这类通用名字的文件,启动时还会把 config.json 当配置读,
+// 所以不能和用户自己的文件混在一起(会覆盖别人的 settings.json,读到别人的 config.json 就起不来)。
+// 空文件夹、默认位置、以前用过的运行目录直接用;别的就在里面建一个 Humanizer 子文件夹。
+func runDirFor(p string) (string, error) {
+	if samePath(p, defaultDataDir()) || isRunDir(p) || isEmptyDir(p) {
+		return p, nil
 	}
-	ents, err := os.ReadDir(from)
+	sub := filepath.Join(p, "Humanizer")
+	if st, err := os.Stat(sub); err == nil && (!st.IsDir() || !(isRunDir(sub) || isEmptyDir(sub))) {
+		return "", fmt.Errorf("%s 里已经有别的文件,里面的 Humanizer 也不是空的:请选一个空文件夹当运行目录", p)
+	}
+	return cleanDir(sub)
+}
+
+// isRunDir:Humanizer 用过的运行目录(每次启动都会写 logs/launcher.log)。
+func isRunDir(p string) bool {
+	return fileExists(filepath.Join(p, "logs", "launcher.log"))
+}
+
+// isEmptyDir:不算系统自己放的隐藏文件。
+func isEmptyDir(p string) bool {
+	ents, err := os.ReadDir(p)
 	if err != nil {
-		a.logf("读不到旧模型目录 %s:%v", from, err)
-		return 0
+		return false
 	}
-	if err := os.MkdirAll(to, 0o755); err != nil {
-		a.logf("建不了新模型目录 %s:%v", to, err)
-		return 0
-	}
-	n := 0
 	for _, e := range ents {
-		name := e.Name()
-		if e.IsDir() || !strings.Contains(strings.ToLower(name), ".gguf") {
-			continue
+		switch strings.ToLower(e.Name()) {
+		case ".ds_store", "desktop.ini", "thumbs.db", ".humanizer-write-test":
+		default:
+			return false
 		}
-		src, dst := filepath.Join(from, name), filepath.Join(to, name)
-		if fileExists(dst) { // 新位置已经有了,别覆盖
-			continue
-		}
-		if err := os.Rename(src, dst); err != nil {
-			if err := cloneFile(src, dst); err != nil {
-				a.logf("搬 %s 失败:%v", name, err)
-				continue
-			}
-			if err := os.Remove(src); err != nil {
-				a.logf("删掉旧文件 %s 失败(新位置已经有了):%v", src, err)
-			}
-		}
-		n++
 	}
-	return n
+	return true
+}
+
+// waitDownloadStopped 等下载协程退出(最多 30 秒),它退出前还会往半截文件里写。
+func (a *App) waitDownloadStopped() {
+	a.mu.Lock()
+	done := a.dlDone
+	a.mu.Unlock()
+	if done == nil {
+		return
+	}
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		a.logf("下载协程 30 秒还没退出,接着换位置")
+	}
+}
+
+// switchLauncherLog 运行目录换了:launcher.log 换到新目录里接着写。
+func (a *App) switchLauncherLog(dataDir string) {
+	if a.logger == nil {
+		return
+	}
+	f, err := os.OpenFile(filepath.Join(dataDir, "logs", "launcher.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		a.logf("新运行目录里开不了日志文件:%v", err)
+		return
+	}
+	a.logger.SetOutput(io.MultiWriter(f, os.Stderr))
+	if a.logFile != nil {
+		_ = a.logFile.Close()
+	}
+	a.logFile = f
+}
+
+// modelFileSuffixes:一个档位在模型目录里可能有的文件(成品、下载半截、更新半截)。
+var modelFileSuffixes = []string{"", ".part", ".part.json", ".update.part", ".update.part.json"}
+
+// moveModelFiles 把 from 下的模型文件搬到 to。只搬配置里档位对应的文件,
+// 用户自己放在同一个目录里的别的东西(比如别的 GGUF 模型)一概不碰。
+// 新位置已经有同名文件就不动它。任何一个搬不过去就全部还原,返回错误。
+// 跨盘符时 os.Rename 失败,改成复制:先复制成 .moving,全部成功后才改名、删旧文件。
+func (a *App) moveModelFiles(from, to string) (int, error) {
+	if from == "" || to == "" || samePath(from, to) {
+		return 0, nil
+	}
+	type job struct{ src, dst string }
+	var jobs []job
+	for _, t := range a.cfg.Tiers {
+		rel := filepath.FromSlash(t.File)
+		for _, suf := range modelFileSuffixes {
+			src, dst := filepath.Join(from, rel)+suf, filepath.Join(to, rel)+suf
+			if fileExists(src) && !fileExists(dst) {
+				jobs = append(jobs, job{src, dst})
+			}
+		}
+	}
+	if len(jobs) == 0 {
+		return 0, nil
+	}
+	var renamed, copied []job
+	undo := func() {
+		for _, j := range renamed {
+			_ = os.Rename(j.dst, j.src)
+		}
+		for _, j := range copied {
+			_ = os.Remove(j.dst + ".moving")
+		}
+	}
+	for _, j := range jobs {
+		if err := os.MkdirAll(filepath.Dir(j.dst), 0o755); err != nil {
+			undo()
+			return 0, fmt.Errorf("建不了新模型目录:%v", err)
+		}
+		if os.Rename(j.src, j.dst) == nil {
+			renamed = append(renamed, j)
+			continue
+		}
+		st, err := os.Stat(j.src)
+		if err != nil {
+			undo()
+			return 0, err
+		}
+		if free, ok := freeDiskBytes(filepath.Dir(j.dst)); ok && free < uint64(st.Size())+256<<20 {
+			undo()
+			return 0, fmt.Errorf("新位置空间不够:%s 要 %.1f GB,只剩 %.1f GB;位置没改", filepath.Base(j.src), float64(st.Size())/gib, float64(free)/gib)
+		}
+		a.logf("跨盘复制 %s → %s(%.1f GB)", j.src, j.dst, float64(st.Size())/gib)
+		if err := cloneFile(j.src, j.dst+".moving"); err != nil {
+			undo()
+			return 0, fmt.Errorf("复制 %s 失败:%v;位置没改", filepath.Base(j.src), err)
+		}
+		copied = append(copied, j)
+	}
+	for _, j := range copied {
+		if err := os.Rename(j.dst+".moving", j.dst); err != nil {
+			a.logf("复制好的 %s 改名失败:%v", j.dst, err)
+			continue
+		}
+		if err := os.Remove(j.src); err != nil {
+			a.logf("删掉旧文件 %s 失败(新位置已经有了):%v", j.src, err)
+		}
+	}
+	return len(jobs), nil
 }
 
 // carryOverFile 把一个设置文件带到新目录(目标已经有了就不动)。
@@ -178,26 +288,33 @@ func carryOverFile(src, dst string) {
 	_ = writeFileAtomic(dst, b)
 }
 
+// cloneFile 复制一个文件,修改时间也带过去(模型指纹缓存按大小+修改时间认文件,不带过去就得重算几分钟哈希)。
 func cloneFile(src, dst string) error {
 	in, err := os.Open(src)
 	if err != nil {
 		return err
 	}
 	defer in.Close()
+	st, err := in.Stat()
+	if err != nil {
+		return err
+	}
 	out, err := os.Create(dst)
 	if err != nil {
 		return err
 	}
-	defer out.Close()
-	if _, err := io.Copy(out, in); err != nil {
+	_, err = io.Copy(out, in)
+	if err == nil {
+		err = out.Sync()
+	}
+	if cerr := out.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
 		_ = os.Remove(dst)
 		return err
 	}
-	if err := out.Sync(); err != nil {
-		_ = os.Remove(dst)
-		return err
-	}
-	return os.Chmod(dst, 0o644)
+	return os.Chtimes(dst, st.ModTime(), st.ModTime())
 }
 
 // ───────────────────────── HTTP ─────────────────────────

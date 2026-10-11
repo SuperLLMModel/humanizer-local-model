@@ -61,6 +61,8 @@ type App struct {
 	backends      []Backend
 	web           fs.FS
 	logger        *log.Logger
+	logFile       *os.File   // launcher.log;运行目录换了就换到新目录里写
+	pathsMu       sync.Mutex // 一次只换一次存储位置
 	port          int
 	url           string
 	apiKey        string // llama-server 的访问密钥,每次启动随机生成,只有启动器的反代知道
@@ -75,6 +77,7 @@ type App struct {
 	dl           *Download
 	dlTier       string
 	dlCancel     context.CancelFunc
+	dlDone       chan struct{} // 当前下载协程退出(半截文件句柄已关)时关闭
 	engine       *engineProc
 	engineCancel context.CancelFunc
 	engInfo      engineInfo
@@ -220,7 +223,8 @@ func (a *App) startDownload(t Tier, ep Endpoint) {
 	if a.dlCancel != nil {
 		a.dlCancel()
 	}
-	a.dl, a.dlTier, a.dlCancel = d, t.ID, cancel
+	done := make(chan struct{})
+	a.dl, a.dlTier, a.dlCancel, a.dlDone = d, t.ID, cancel, done
 	a.tier = t.ID
 	a.phase = phaseDownloading
 	a.errInfo = nil
@@ -228,6 +232,7 @@ func (a *App) startDownload(t Tier, ep Endpoint) {
 	a.logf("开始下载 %s ← %s", t.File, d.URL)
 
 	go func() {
+		defer close(done)
 		err := d.Run(ctx)
 		a.mu.Lock()
 		if a.dl != d { // 已经被新的下载顶替

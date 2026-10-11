@@ -188,15 +188,11 @@ type statusResp struct {
 
 func (a *App) handleStatus(w http.ResponseWriter, r *http.Request) {
 	dataDir, modelsDir := a.pathsNow()
-	defDir := a.pointerDir
-	if defDir == "" {
-		defDir = defaultDataDir()
-	}
 	s := statusResp{
 		App: "humanizer", Version: a.opts.Version, Sys: a.sys,
 		Recommended: a.cfg.recommendTier(a.sys.RAMGB),
 		Endpoints:   a.cfg.Endpoints,
-		DataDir:     dataDir, ModelDir: modelsDir, DefaultDataDir: defDir, DataDirLocked: a.dataDirLocked,
+		DataDir:     dataDir, ModelDir: modelsDir, DefaultDataDir: defaultDataDir(), DataDirLocked: a.dataDirLocked,
 		IdleExitMinutes: int(a.idleExit / time.Minute),
 		CtxSize:         a.cfg.Engine.CtxSize,
 	}
