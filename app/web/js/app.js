@@ -259,8 +259,9 @@ function renderPaths() {
   data.title = data.value;
   model.title = model.value;
   $('paths-hint').textContent = t(pathsHintKey(st));
-  $('paths-note').innerHTML = locked ? t('paths.locked')
-    : t('paths.note', { data: st.default_data_dir || st.data_dir, model: modelDirDefault(st) });
+  // 路径是用户起的文件夹名,可能带 < > &:只当文字放,别当 HTML 解析
+  if (locked) $('paths-note').innerHTML = t('paths.locked');
+  else $('paths-note').textContent = t('paths.note', { data: st.default_data_dir || st.data_dir, model: modelDirDefault(st) });
 }
 
 async function pickDir(what) {

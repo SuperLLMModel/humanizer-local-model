@@ -24,12 +24,11 @@ export function modelDirDefault(st) {
   return base ? base + sepOf(st) + 'models' : '';
 }
 
-/** 两个目录是不是同一处。Windows / macOS 上忽略大小写。 */
+/** 两个目录是不是同一处。忽略大小写:Windows 和 macOS 的文件系统默认都不分大小写,
+ *  这里只用来决定摘要上写「默认」还是「已自定义」,Linux 上偶尔认错也无妨。 */
 export function sameDir(a, b) {
   const x = trimSlash(a), y = trimSlash(b);
-  if (!x || !y) return false;
-  const mac = typeof navigator !== 'undefined' && /Mac/i.test(navigator.platform || '');
-  return mac ? x === y : x.toLowerCase() === y.toLowerCase();
+  return !!x && !!y && x.toLowerCase() === y.toLowerCase();
 }
 
 /** 用户改过存储位置没有(摘要上显示「默认在系统盘」还是「已自定义」)。
