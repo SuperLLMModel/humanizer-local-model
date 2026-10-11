@@ -6,7 +6,7 @@ import { withLangGuard, langDrift } from './guard.js';
 import { tokenize, diffTokens, markBits, factBits, renderRuns, flagNumbers } from './diff.js';
 import { countText, isMostlyCJK, isLongDraft, numberCheck, fmtBytes, fmtDuration, fmtNum, escapeHTML, pyStrip } from './text.js';
 import { loadHistory, addHistory, removeHistory, clearHistory, store } from './history.js';
-import { planDocument, documentSignature, newDocumentJob, readDocumentJob, jobMatches, combinedDocument, runDocumentSections } from './document.js';
+import { planDocument, needsSections, approxTokens, documentSignature, newDocumentJob, readDocumentJob, jobMatches, jobDone, combinedDocument, runDocumentSections } from './document.js';
 import { SAMPLES } from './samples.js';
 import { activeFacts, protectFacts, restoreFacts, streamView, withFactGuard, FACT_TRIES } from './facts.js';
 
@@ -18,9 +18,10 @@ const BACKEND = { metal: 'Metal', cuda: 'CUDA', vulkan: 'Vulkan', cpu: 'CPU', cu
 
 const S = {
   protect: null, // 本次改写的占位符信息(Create fact),流式显示时用来换回原文
-  docJob: readDocumentJob(store.get('document', 'null')),
+  docJob: readDocumentJob(store.get('document', 'null')), // 长文分段改写的断点(document.js)
   docPlanning: false,
   docSaveFailed: false,
+  outPrefix: '', // 分段改写时已完成的各段,流式显示接在它后面
   retryable: false, // 上一次因为保留的文字没带过来而作废:允许直接点「重新生成」
   status: null,
   cfg: null,
@@ -54,14 +55,13 @@ function init() {
   onDraftInput(false);
   setDiffToggle(S.showDiff);
   bind();
+  // 刷新前有没改完的长文:显示已完成的段,进度条上点「继续改写」(或 ⌘↵)接着改
+  if (S.docJob && jobDone(S.docJob)) discardDocumentJob();
   if (S.docJob) {
-    $('output').textContent = combinedDocument(S.docJob);
-    $('out-empty').hidden = !!$('output').textContent;
-    if (S.docJob.outputs.length === S.docJob.parts.length) {
-      S.result = makeResult(S.docJob.draft, combinedDocument(S.docJob));
-      renderResult();
-    }
+    showPartialDocument(S.docJob);
+    showNotice('', t('document.restored'));
   }
+  updateDocumentProgress();
   loadConfig();
   poll();
   if (params.get('panel') === 'history') openDrawer(true);
@@ -464,6 +464,7 @@ function maybeAutoRun() {
 
 // 流式输出按帧合并渲染。注意:改写结束后可能还有一帧没跑(后台标签页里 rAF 会被推迟),
 // 它不能再把带高亮的结果覆盖成纯文本 —— 所以结束时取消,回调里也再查一次。
+// 分段改写时 S.outPrefix 是已经完成的各段(按原文空白拼好),正在写的这段接在后面。
 let renderRaf = 0;
 function scheduleStreamRender() {
   if (renderRaf) return;
@@ -474,7 +475,7 @@ function scheduleStreamRender() {
     const nearBottom = out.scrollHeight - out.scrollTop - out.clientHeight < 80;
     const caret = document.createElement('span');
     caret.className = 'caret';
-    const shown = S.protect ? streamView(S.out, S.protect) : S.out;
+    const shown = S.outPrefix + (S.protect ? streamView(S.out, S.protect) : S.out);
     out.replaceChildren(shown.replace(/^\s+/, ''), caret);
     out.classList.toggle('cjk', isMostlyCJK(shown));
     $('out-empty').hidden = true;
@@ -484,20 +485,92 @@ function scheduleStreamRender() {
   });
 }
 
-async function run() {
-  if (S.running) { stop(); return; }
-  const draft = $('draft').value;
-  if (!pyStrip(draft)) return;
-  if (!S.promptOK || !S.cfg) { showNotice('err', t('out.promptMismatch')); return; }
-  if (S.status?.phase !== 'ready') { toast(t('out.notReady')); return; }
+function cancelStreamRender() {
+  if (renderRaf) { cancelAnimationFrame(renderRaf); renderRaf = 0; }
+}
 
-  if (S.docJob || isLongDraft(draft) || draft.length > 1800) { await runLongDocument(); return; }
-  const protectedDraft = protectFacts(draft, S.facts);
+// 「读稿中」提示;分段改写时前面先显示已经完成的段。
+function showReading(note, p) {
+  const prefix = S.outPrefix ? escapeHTML(S.outPrefix.replace(/^\s+/, '')) : '';
+  $('output').innerHTML = `${prefix}<span class="reading">${note ? escapeHTML(note) : t('out.reading', { p })}</span>`;
+}
+
+// token 数:引擎 /tokenize(不加 BOS)。停止 / 超时照常抛出;其他错误(比如接口不可用)退回按字数估算。
+async function tokensOf(text, signal) {
+  try { return await countTokens(text, { signal }); } catch (e) {
+    if (signal?.aborted || e.name === 'AbortError' || e.name === 'TimeoutError') throw e;
+    return approxTokens(text);
+  }
+}
+
+/**
+ * 改写一篇草稿(单篇,或长文里的一段)。同一提示词、同一采样参数,单篇和分段走的是这同一个函数:
+ *  - 语言保险(guard.js):英文草稿写着写着成了中文,当场掐掉、同样参数静默重采,最多 3 次;最后一次照常交出。
+ *  - Create fact(facts.js):写完核对占位符,丢了/改了/重复了就整篇重写,最多 FACT_TRIES 次;都不行就作废。
+ * 返回 withFactGuard 的结果 { ok, text, tries, final }。用户停止抛 AbortError。
+ */
+async function generate(draft, pd, nPred, signal) {
+  const body = {
+    ...S.cfg.sampling,
+    prompt: buildPrompt(S.cfg, pd.text),
+    n_predict: nPred,
+    stream: true,
+    cache_prompt: true,
+    return_progress: true,
+  };
+  const locked = pd.locks.length > 0;
+  S.protect = locked ? pd : null;
+  let note = '';
+  const attempt = async (i, isLast) => {
+    if (signal.aborted) throw new DOMException('stopped', 'AbortError');
+    const ctl = new AbortController();
+    const onStop = () => ctl.abort();
+    signal.addEventListener('abort', onStop);
+    let fin = null, drifted = false;
+    S.out = '';
+    if (i > 0) showReading(note, 0);
+    try {
+      for await (const ev of streamCompletion(body, ctl.signal)) {
+        if (ev.prompt_progress && !S.out) {
+          const pp = ev.prompt_progress;
+          showReading(note, pp.total ? Math.round((100 * pp.processed) / pp.total) : 0);
+        }
+        if (ev.content) {
+          S.out += ev.content;
+          if (!isLast && langDrift(draft, locked ? restoreFacts(S.out, pd, false) : S.out, false)) { drifted = true; ctl.abort(); break; }
+          scheduleStreamRender();
+        }
+        if (ev.stop) { fin = ev; break; }
+      }
+    } catch (e) {
+      if (!(drifted && e.name === 'AbortError' && !signal.aborted)) throw e;
+    } finally {
+      signal.removeEventListener('abort', onStop);
+    }
+    if (drifted) {
+      cancelStreamRender();
+      showReading(note, 0);
+    }
+    return { text: locked ? restoreFacts(S.out, pd, false) : S.out, final: fin, drifted };
+  };
+  return withFactGuard(pd, async () => {
+    const res = await withLangGuard(draft, attempt);
+    return { raw: S.out, final: res.final };
+  }, FACT_TRIES, (n, m) => {
+    cancelStreamRender();
+    note = t('facts.retrying', { n, m });
+    showReading(note, 0);
+  });
+}
+
+// 开始一次改写(单篇或分段):清掉上一次的结果和提示。
+function beginRun() {
   togglePop(false);
   closeNumbers();
   S.running = true;
   S.abort = new AbortController();
   S.out = '';
+  S.outPrefix = '';
   S.result = null;
   renderDraftMarks();
   $('out-notice').hidden = true;
@@ -507,87 +580,38 @@ async function run() {
   $('out-count').textContent = '';
   $('out-empty').hidden = true;
   $('output').classList.remove('cjk');
-  $('output').innerHTML = `<span class="reading">${t('out.reading', { p: 0 })}</span>`;
+  showReading('', 0);
   updateGo();
   renderStatus();
+}
+
+async function run() {
+  if (S.running) { stop(); return; }
+  const draft = $('draft').value;
+  if (!pyStrip(draft)) return;
+  if (!S.promptOK || !S.cfg) { showNotice('err', t('out.promptMismatch')); return; }
+  if (S.status?.phase !== 'ready') { toast(t('out.notReady')); return; }
+  // 这篇草稿有没改完的分段进度(停止过、出过错、刷新过页面):接着改,已完成的段不再送进引擎
+  if (resumableJob(draft)) { await runDocument(draft, true); return; }
+
+  const protectedDraft = protectFacts(draft, S.facts);
+  beginRun();
 
   const t0 = performance.now();
   const runSignal = S.abort.signal;
-  let final = null, error = null, aborted = false, factsLost = false, factTries = 0;
+  let final = null, error = null, aborted = false, factsLost = false, factTries = 0, sectioned = false;
   try {
-    let nTok;
-    try { nTok = await countTokens(pyStrip(draft), { signal: runSignal }); } catch (e) {
-      if (runSignal.aborted || e.name === 'AbortError' || e.name === 'TimeoutError') throw e;
-      nTok = Math.ceil(countText(draft).chars / 3);
-    }
-    const nPred = nPredictFor(S.cfg, nTok);
-    const r = S.cfg.n_predict;
-    let promptTokens;
-    const prompt = buildPrompt(S.cfg, protectedDraft.text);
-    try { promptTokens = await countTokens(prompt, { signal: runSignal }); } catch (e) {
-      if (runSignal.aborted || e.name === 'AbortError' || e.name === 'TimeoutError') throw e;
-      promptTokens = Math.ceil(prompt.length / 3);
-    }
+    const nTok = await tokensOf(pyStrip(draft), runSignal);
+    const promptTokens = await tokensOf(buildPrompt(S.cfg, protectedDraft.text), runSignal);
     if (runSignal.aborted) throw runSignal.reason;
-    if (promptTokens + nPred > S.cfg.ctx_size) throw Object.assign(new Error('documentNeeded'), { documentNeeded: true });
-    if (nTok * r.factor > r.max) showNotice('warn', t('out.longDraft', { n: fmtNum(nTok, getLang()) }));
-    const body = {
-      ...S.cfg.sampling,
-      prompt,
-      n_predict: nPred,
-      stream: true,
-      cache_prompt: true,
-      return_progress: true,
-    };
-    // 语言保险(guard.js):英文草稿写着写着成了中文,当场掐掉、同样参数静默重采,最多 3 次;最后一次照常交出。
-    // Create fact(facts.js):写完核对占位符,丢了/改了/重复了就整篇重写,最多 FACT_TRIES 次;都不行就作废。
-    const locked = protectedDraft.locks.length > 0;
-    S.protect = locked ? protectedDraft : null;
-    let note = '';
-    const reading = (p) => { $('output').innerHTML = `<span class="reading">${note ? escapeHTML(note) : t('out.reading', { p })}</span>`; };
-    const attempt = async (i, isLast) => {
-      if (runSignal.aborted) throw new DOMException('stopped', 'AbortError');
-      const ctl = new AbortController();
-      const onStop = () => ctl.abort();
-      runSignal.addEventListener('abort', onStop);
-      let fin = null, drifted = false;
-      S.out = '';
-      if (i > 0) reading(0);
-      try {
-        for await (const ev of streamCompletion(body, ctl.signal)) {
-          if (ev.prompt_progress && !S.out) {
-            const pp = ev.prompt_progress;
-            reading(pp.total ? Math.round((100 * pp.processed) / pp.total) : 0);
-          }
-          if (ev.content) {
-            S.out += ev.content;
-            if (!isLast && langDrift(draft, locked ? restoreFacts(S.out, protectedDraft, false) : S.out, false)) { drifted = true; ctl.abort(); break; }
-            scheduleStreamRender();
-          }
-          if (ev.stop) { fin = ev; break; }
-        }
-      } catch (e) {
-        if (!(drifted && e.name === 'AbortError' && !runSignal.aborted)) throw e;
-      } finally {
-        runSignal.removeEventListener('abort', onStop);
+    // 长草稿(输出可能顶到上限,或者放不进上下文)自动分段;其余草稿走下面原来的单篇流程,一点不变
+    if (needsSections(S.cfg, nTok, promptTokens)) sectioned = true;
+    else {
+      const fg = await generate(draft, protectedDraft, nPredictFor(S.cfg, nTok), runSignal);
+      final = fg.final;
+      if (protectedDraft.locks.length) {
+        if (fg.ok) { S.out = fg.text; factTries = fg.tries; } else { factsLost = true; S.out = ''; }
       }
-      if (drifted) {
-        if (renderRaf) { cancelAnimationFrame(renderRaf); renderRaf = 0; }
-        reading(0);
-      }
-      return { text: locked ? restoreFacts(S.out, protectedDraft, false) : S.out, final: fin, drifted };
-    };
-    const fg = await withFactGuard(protectedDraft, async () => {
-      const res = await withLangGuard(draft, attempt);
-      return { raw: S.out, final: res.final };
-    }, FACT_TRIES, (n, m) => {
-      if (renderRaf) { cancelAnimationFrame(renderRaf); renderRaf = 0; }
-      note = t('facts.retrying', { n, m });
-      reading(0);
-    });
-    final = fg.final;
-    if (locked) {
-      if (fg.ok) { S.out = fg.text; factTries = fg.tries; } else { factsLost = true; S.out = ''; }
     }
   } catch (e) {
     if (e.name === 'AbortError') aborted = true;
@@ -598,11 +622,11 @@ async function run() {
   S.running = false;
   S.abort = null;
   S.protect = null;
+  cancelStreamRender();
+  if (sectioned && !aborted && !error) { await runDocument(draft, false); return; }
   S.retryable = factsLost;
-  if (renderRaf) { cancelAnimationFrame(renderRaf); renderRaf = 0; }
   const secs = (performance.now() - t0) / 1000;
   const text = S.out.trim();
-  if (error?.documentNeeded) { await runLongDocument(); return; }
 
   if (error && !text) {
     $('output').replaceChildren();
@@ -638,28 +662,45 @@ async function run() {
   renderStatus();
 }
 
-function updateDocumentProgress() {
+// ───────────────────────── 长文分段改写(document.js)─────────────────────────
+// 断点存在浏览器 localStorage(hz.document),每完成一段存一次;草稿或保留段一改就作废,模型/设置变了不能接着用。
+// 分段改写进行中草稿框只读(停止后恢复),免得改到一半的草稿和断点对不上。
+const engineSignature = () => documentSignature(S.cfg, S.status?.tier || '');
+
+function resumableJob(draft) {
   const job = S.docJob;
-  const panel = $('document-progress');
+  return !!(job && S.cfg && !jobDone(job) && jobMatches(job, draft, S.facts, engineSignature())) && job;
+}
+
+function updateDocumentProgress() {
+  const job = S.docJob, panel = $('document-progress');
   panel.hidden = !job && !S.docPlanning;
   if (panel.hidden) return;
-  const done = job?.outputs.length || 0, total = job?.parts.length || 1;
-  const complete = job && done === total;
-  $('document-meter').max = total;
-  $('document-meter').value = done;
-  const key = S.docPlanning ? 'document.planning' : complete ? 'document.complete' : S.running ? 'document.section' : 'document.paused';
-  $('document-status').textContent = t(key, {n: Math.min(done+1,total), done, total});
+  const done = job?.outputs.length || 0, total = job?.parts.length || 0;
+  const meter = $('document-meter');
+  meter.max = Math.max(1, total);
+  if (S.docPlanning) meter.removeAttribute('value'); else meter.value = done;
+  const stale = !!(job && S.cfg && S.status && job.signature !== engineSignature());
+  const key = S.docPlanning ? 'document.planning' : S.running ? 'document.section' : stale ? 'document.stale' : 'document.paused';
+  $('document-status').textContent = t(key, { n: fmtNum(Math.min(done + 1, total), getLang()), done: fmtNum(done, getLang()), total: fmtNum(total, getLang()) });
   const ready = S.status?.phase === 'ready' && S.promptOK;
-  $('btn-document-resume').hidden = S.running || !job || complete;
+  $('btn-document-resume').hidden = S.running || !job || stale;
   $('btn-document-resume').disabled = !ready;
   $('btn-document-restart').hidden = S.running || !job;
   $('btn-document-restart').disabled = !ready;
 }
 
 function discardDocumentJob() {
-  if (S.docJob && !S.result) { $('output').textContent = ''; $('out-empty').hidden = false; $('out-notice').hidden = true; }
+  if (!S.docJob) return;
+  const showingPartial = !S.result && !S.running;
   S.docJob = null;
   store.set('document', 'null');
+  if (showingPartial) {
+    $('output').replaceChildren();
+    $('out-empty').hidden = false;
+    $('out-notice').hidden = true;
+    $('out-count').textContent = '';
+  }
   updateDocumentProgress();
 }
 
@@ -669,91 +710,125 @@ function saveDocumentJob(job) {
   store.set('facts', JSON.stringify(job.facts));
   const saved = JSON.stringify(job);
   store.set('document', saved);
-  S.docSaveFailed = store.get('document') !== saved;
+  S.docSaveFailed = store.get('document') !== saved; // 无痕模式 / 存储满 / localStorage 不可用:只在这个页面里能接着改
+}
+
+function lockDraft(on) {
+  const ta = $('draft');
+  ta.readOnly = on;
+  ta.classList.toggle('locked', on);
+  ta.title = on ? t('document.locked') : '';
+  $('btn-clear').disabled = on;
+  $('btn-paste').disabled = on;
+  for (const button of $('sample-btns').querySelectorAll('button')) button.disabled = on;
+}
+
+function showPartialDocument(job) {
+  const text = job ? combinedDocument(job) : '';
+  $('output').textContent = text.replace(/^\s+/, '');
+  $('output').classList.toggle('cjk', isMostlyCJK(text));
+  $('out-empty').hidden = !!text;
+  $('out-count').innerHTML = text ? t('count.zh', { n: fmtNum(countText(text).units, getLang()) }) : '';
+}
+
+async function runDocument(draft, resume) {
+  const facts = activeFacts(S.facts, draft);
+  const signature = engineSignature();
+  let job = resume ? resumableJob(draft) : null;
+  beginRun();
+  S.retryable = false;
+  S.docPlanning = !job;
+  S.docSaveFailed = false;
+  lockDraft(true);
+  if (job) { S.outPrefix = combinedDocument(job); showReading('', 0); }
   updateDocumentProgress();
-}
-
-async function rewriteDocumentSection(draft, facts, signal) {
-  const protectedDraft = protectFacts(draft, facts);
-  const prompt = buildPrompt(S.cfg, protectedDraft.text);
-  const tokens = await countTokens(protectedDraft.text, {signal});
-  const nPred = nPredictFor(S.cfg, tokens);
-  const promptTokens = await countTokens(prompt, {signal});
-  if (promptTokens + nPred + 64 > S.cfg.ctx_size) throw new Error('documentContext');
-  // Reuse the same fact and language guards as a single-draft rewrite.
-  const fg = await withFactGuard(protectedDraft, async () => {
-    const res = await withLangGuard(draft, async (i, isLast) => {
-      if (signal.aborted) throw new DOMException('stopped', 'AbortError');
-      const ctl = new AbortController();
-      const stop = () => ctl.abort();
-      signal.addEventListener('abort', stop);
-      let raw = '', final = null, drifted = false;
-      try {
-        for await (const ev of streamCompletion({...S.cfg.sampling, prompt, n_predict:nPred, stream:true, cache_prompt:true}, ctl.signal)) {
-          raw += ev.content || '';
-          if (!isLast && langDrift(draft, restoreFacts(raw, protectedDraft, false), false)) { drifted = true; ctl.abort(); break; }
-          if (ev.stop) { final = ev; break; }
-        }
-      } catch (e) { if (!(drifted && e.name === 'AbortError' && !signal.aborted)) throw e; }
-      finally { signal.removeEventListener('abort', stop); }
-      return {raw, final, text:restoreFacts(raw,protectedDraft,false), drifted};
-    });
-    return {raw:res.raw, final:res.final};
-  });
-  if (!fg.ok) throw new Error('factsLost');
-  if (!fg.final || fg.final.stop_type === 'limit' || !fg.text.trim()) throw new Error('documentIncomplete');
-  return fg.text;
-}
-
-async function runLongDocument(resume = false) {
-  if (S.running || !S.promptOK || S.status?.phase !== 'ready') return;
-  const draft = $('draft').value, facts = activeFacts(S.facts,draft);
-  if (!draft.trim()) return;
-  const signature = documentSignature(S.cfg, S.status.tier);
-  if (resume && !jobMatches(S.docJob,draft,facts,signature)) { toast(t('document.changed')); return; }
-  const reuse = jobMatches(S.docJob,draft,facts,signature) && S.docJob.outputs.length < S.docJob.parts.length;
-  S.running = true; S.abort = new AbortController(); S.result = null; S.retryable = false;
-  S.docPlanning = !reuse; S.docSaveFailed = false;
-  $('out-notice').hidden = true; $('out-empty').hidden = true; $('chip-numbers').hidden = true;
-  $('out-stats').textContent = ''; $('out-count').textContent = '';
-  $('output').textContent = reuse ? combinedDocument(S.docJob) : '';
-  $('draft').readOnly = true;
-  $('btn-clear').disabled = true; $('btn-paste').disabled = true;
-  for (const button of $('sample-btns').querySelectorAll('button')) button.disabled = true;
-  updateGo(); renderStatus();
   const signal = S.abort.signal;
+  const t0 = performance.now();
+  let tok = 0, genSecs = 0, error = null, aborted = false, text = '';
   try {
-    if (!reuse) {
-      S.docJob = null;
-      const parts = await planDocument(draft,facts,S.cfg,countTokens,signal);
-      saveDocumentJob(newDocumentJob(draft,facts,signature,parts));
+    if (!job) {
+      discardDocumentJob();
+      const parts = await planDocument(draft, facts, S.cfg, (s, o) => tokensOf(s, o?.signal), signal);
+      job = newDocumentJob(draft, facts, signature, parts);
+      saveDocumentJob(job);
     }
     S.docPlanning = false;
-    const job = S.docJob;
-    const text = await runDocumentSections(job,rewriteDocumentSection, {signal,
+    updateDocumentProgress();
+    text = await runDocumentSections(job, async (part, jobFacts, sig, i) => {
+      S.outPrefix = combinedDocument(job) + job.parts[i].before;
+      S.out = '';
+      showReading('', 0);
+      const pd = protectFacts(part, jobFacts);
+      const nTok = await tokensOf(pyStrip(part), sig);
+      const fg = await generate(part, pd, nPredictFor(S.cfg, nTok), sig);
+      S.protect = null;
+      if (!fg.ok) throw new Error('factsLost');
+      if (!fg.final || fg.final.stop_type === 'limit') throw new Error('documentIncomplete');
+      const n = fg.final.tokens_predicted || 0, tps = fg.final.timings?.predicted_per_second;
+      tok += n;
+      if (tps) genSecs += n / tps;
+      return fg.text;
+    }, {
+      signal,
       onProgress: () => updateDocumentProgress(),
-      onCommit: (j) => { saveDocumentJob(j); $('output').textContent = combinedDocument(j); },
+      onCommit: (j) => saveDocumentJob(j),
     });
-    S.out = text; S.result = makeResult(draft,text);
-    addHistory({id:Date.now().toString(36)+Math.random().toString(36).slice(2,6), t:Date.now(), draft, facts, out:text,
-      tier:S.status.tier, tierLabel:tierOf(S.status.tier)?.label, sections:job.parts.length, stop:'eos', ratio:S.result.diff?.ratio ?? null});
-    store.set('document', 'null');
-    renderResult();
-    if (S.docSaveFailed) showNotice('warn',t('document.storage'));
-    else showNotice('', t('document.review'));
   } catch (e) {
-    $('output').textContent = S.docJob ? combinedDocument(S.docJob) : '';
-    $('out-empty').hidden = !!$('output').textContent;
-    const messages = {factsLost:'document.factFailed', documentIncomplete:'document.incomplete', documentContext:'document.context'};
-    const message = e.name === 'AbortError' ? t('document.stopped') : messages[e.message] ? t(messages[e.message]) : t('out.failed',{msg:escapeHTML(e.message)});
-    showNotice(e.name === 'AbortError' ? '' : 'warn', message + (S.docSaveFailed ? ' ' + t('document.storage') : ''));
-  } finally {
-    S.running = false; S.abort = null; S.docPlanning = false;
-    $('draft').readOnly = false;
-    $('btn-clear').disabled = false; $('btn-paste').disabled = false;
-    for (const button of $('sample-btns').querySelectorAll('button')) button.disabled = false;
-    updateGo(); renderStatus();
+    if (e.name === 'AbortError') aborted = true;
+    else error = e;
   }
+  S.running = false;
+  S.abort = null;
+  S.protect = null;
+  S.docPlanning = false;
+  S.outPrefix = '';
+  S.out = '';
+  cancelStreamRender();
+  lockDraft(false);
+  const storageNote = S.docSaveFailed ? ' ' + t('document.storage') : '';
+  if (!aborted && !error) {
+    const secs = (performance.now() - t0) / 1000;
+    const tps = genSecs > 0 ? tok / genSecs : 0;
+    S.docJob = null; // 做完了:断点清掉,结果进历史
+    store.set('document', 'null');
+    S.result = makeResult(draft, text, facts);
+    $('out-stats').textContent = t('out.stats', { tok: fmtNum(tok, getLang()), tps: tps ? tps.toFixed(1) : '—', sec: secs.toFixed(1) });
+    addHistory({
+      id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+      t: Date.now(), draft, facts, out: text, tier: S.status?.tier, tierLabel: tierOf(S.status?.tier)?.label, tok, tps: tps || undefined,
+      ratio: S.result.diff ? S.result.diff.ratio : null, stop: 'eos', sections: job.parts.length,
+    });
+    renderResult();
+    const tooBig = S.showDiff && !S.result.diff ? ' ' + t('diff.tooBig') : '';
+    showNotice('', t('document.review', { n: fmtNum(job.parts.length, getLang()) }) + tooBig);
+  } else {
+    showPartialDocument(S.docJob);
+    let msg;
+    if (aborted) msg = S.docJob?.outputs.length ? t('document.stopped', { key: KEY_LABEL }) : t('out.stopped');
+    else if (error.name === 'TimeoutError') msg = t('out.requestTimeout');
+    else if (DOC_ERRORS[error.message]) msg = t(DOC_ERRORS[error.message], { n: FACT_TRIES });
+    else msg = t('out.failed', { msg: escapeHTML(error.message) });
+    if (!aborted && S.docJob) msg += ' ' + t('document.resumeHint');
+    showNotice(aborted ? '' : 'warn', msg + storageNote);
+  }
+  updateDocumentProgress();
+  updateGo();
+  renderStatus();
+}
+
+const DOC_ERRORS = { factsLost: 'document.factFailed', documentIncomplete: 'document.incomplete', documentContext: 'document.context', documentEmpty: 'document.context' };
+
+function downloadText() {
+  const r = S.result;
+  if (!r || S.running) return;
+  const url = URL.createObjectURL(new Blob([r.out], { type: 'text/plain;charset=utf-8' }));
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = 'humanizer-rewrite.txt';
+  document.body.append(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 function stop() {
@@ -1102,7 +1177,6 @@ function renderFacts(fresh = '') {
       store.set('facts', JSON.stringify(S.facts));
       renderFacts();
       updateFactSelection();
-      updateDocumentProgress();
     });
     li.append(text, remove);
     return li;
@@ -1122,20 +1196,13 @@ function jumpToFact(fact) {
 }
 
 function bind() {
-  $('btn-document-resume').addEventListener('click', () => runLongDocument(true));
+  $('btn-document-resume').addEventListener('click', () => run());
   $('btn-document-restart').addEventListener('click', () => {
-    if (!confirm(t('document.confirmRestart'))) return;
-    S.docJob = null;
-    store.set('document', 'null');
-    runLongDocument();
+    if (S.running || !confirm(t('document.confirmRestart'))) return;
+    discardDocumentJob();
+    run();
   });
-  $('btn-download-text').addEventListener('click', () => {
-    if (!S.result || S.running) return;
-    const url = URL.createObjectURL(new Blob([S.result.out], {type:'text/plain;charset=utf-8'}));
-    const link = document.createElement('a');
-    link.href = url; link.download = 'humanizer-rewrite.txt'; link.click();
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
-  });
+  $('btn-download-text').addEventListener('click', downloadText);
   $('btn-upload').addEventListener('click', () => { if (!S.running && !importing) $('document-file').click(); });
   $('document-file').addEventListener('change', () => {
     const file = $('document-file').files[0];
@@ -1164,7 +1231,6 @@ function bind() {
     ta.focus({ preventScroll: true });
     ta.setSelectionRange(ta.selectionEnd, ta.selectionEnd);
     updateFactSelection();
-    updateDocumentProgress();
     toast(t('facts.created'), 'ok');
   });
   $('draft').addEventListener('input', () => onDraftInput());

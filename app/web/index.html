@@ -174,7 +174,7 @@
           <span class="dz-sub mono">.docx · .pdf</span>
         </div>
       </div>
-      <p class="draft-note" id="draft-long" role="note" hidden><svg aria-hidden="true"><use href="#i-info"/></svg><span data-i18n="draft.long">长文档改写可能出现事实偏差，建议检查结果，或让 AI 把改错的地方纠正一下。</span></p>
+      <p class="draft-note" id="draft-long" role="note" hidden><svg aria-hidden="true"><use href="#i-info"/></svg><span data-i18n="draft.long">草稿较长，会自动分段改写。长文档更容易出现事实偏差，建议检查结果，或让 AI 把改错的地方纠正一下。</span></p>
       <div class="factbar" id="facts-panel" hidden>
         <span class="factbar-label" data-i18n-attr="title:facts.help"><svg aria-hidden="true"><use href="#i-lock"/></svg><span data-i18n="facts.title">原样保留</span><span class="factbar-count mono" id="facts-count"></span></span>
         <p class="factbar-hint" id="facts-hint" data-i18n="facts.hint">在草稿里选中名字、数字、引文或术语，点「原样保留」，改写时一字不改。</p>
@@ -211,10 +211,12 @@
       </header>
       <div class="sheet-body" id="out-body">
         <div class="document-progress" id="document-progress" hidden>
-          <p id="document-status" role="status" aria-live="polite"></p>
+          <div class="dp-row">
+            <p id="document-status" role="status" aria-live="polite"></p>
+            <button class="tool" id="btn-document-resume" type="button" hidden><svg><use href="#i-arrow"/></svg><span data-i18n="document.resume">继续改写</span></button>
+            <button class="tool" id="btn-document-restart" type="button" hidden><svg><use href="#i-redo"/></svg><span data-i18n="document.restart">重新开始</span></button>
+          </div>
           <progress id="document-meter" value="0" max="1" data-i18n-attr="aria-label:document.progress"></progress>
-          <button class="tool" id="btn-document-resume" type="button" hidden data-i18n="document.resume">继续改写</button>
-          <button class="tool" id="btn-document-restart" type="button" hidden data-i18n="document.restart">重新开始</button>
         </div>
         <div class="notice" id="out-notice" hidden></div>
         <div class="textview" id="output" aria-live="polite"></div>
@@ -230,7 +232,7 @@
         <span class="mono dim small stats" id="out-stats"></span>
         <span class="grow"></span>
         <button class="tool" id="btn-regen" type="button" disabled><svg><use href="#i-redo"/></svg><span data-i18n="out.regen">重新生成</span></button>
-        <button class="tool" id="btn-download-text" type="button" disabled data-i18n="document.download">下载文本</button>
+        <button class="tool" id="btn-download-text" type="button" disabled data-i18n-attr="title:document.downloadHelp"><svg><use href="#i-update"/></svg><span data-i18n="document.download">下载</span></button>
         <button class="tool solid" id="btn-copy" type="button" disabled><svg><use href="#i-copy"/></svg><span data-i18n="out.copy">复制</span></button>
       </footer>
     </article>

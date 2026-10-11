@@ -1,5 +1,6 @@
 import { getJSON, postJSON, countTokens } from '../web/js/api.js';
-import { planDocument, newDocumentJob, documentSignature, readDocumentJob, jobMatches, combinedDocument, runDocumentSections } from '../web/js/document.js';
+import { planDocument, needsSections, newDocumentJob, documentSignature, readDocumentJob, jobMatches, jobDone, combinedDocument, runDocumentSections, SECTION_MAX } from '../web/js/document.js';
+import { store, addHistory, loadHistory, clearHistory } from '../web/js/history.js';
 // 网页纯逻辑的单测(不需要浏览器):node devtools/webtest.mjs 或 bun devtools/webtest.mjs
 import { activeFacts, protectFacts, restoreFacts, streamView, withFactGuard, FACT_TRIES } from '../web/js/facts.js';
 import { createHash } from 'node:crypto';
@@ -218,48 +219,125 @@ for (const s of fx.samples) {
   } finally {globalThis.fetch=originalFetch;}
 }
 
-// Long-document planning and durable, section-level commits.
+// Long-document planning and durable, section-level commits(PR #5,0.3.4 集成时重写了切分)
 {
-  const dc = {...cfg, ctx_size:4096};
-  const count = async (s) => Math.ceil([...s].length / 4);
-  const source = '  '+Array.from({length:12}, (_,i)=>`Section ${i}: ` + 'Nadia approved 42 files. '.repeat(70)).join('\r\n\r\n')+'  ';
-  const fact = 'Nadia approved 42 files.';
-  const parts = await planDocument(source,[fact],dc,count);
-  ok(parts.length > 1 && parts.map(p=>p.before+p.draft+p.after).join('')===source, 'Document plan preserves source and paragraph separators exactly');
-  ok(parts.every(p=>!p.draft.includes('HZ_LOCK_')), 'Plan contains original passages rather than placeholders');
-  for (const p of parts) {
-    const masked=protectFacts(p.draft,[fact]).text, tokens=await count(masked);
-    ok(tokens<=700 && await count(buildPrompt(dc,masked))+nPredictFor(dc,tokens)+64<=dc.ctx_size, 'Every section fits actual input and output token budgets');
+  const dc = {...cfg, ctx_size:8192, sampling:{temperature:1,top_p:0.95}};
+  // 假 tokenizer:汉字 1 个 1 token,其余 4 个字符 1 token(和 approxTokens 的估算故意不一样,逼出「实测再切」)
+  const HAN=/[㐀-鿿]/g;
+  let calls=0;
+  const count = async (s) => { calls++; return (s.match(HAN)||[]).length + Math.ceil(s.replace(HAN,'').length/4); };
+  const joined = (parts) => parts.map(p=>p.before+p.draft+p.after).join('');
+  const realMax = async (parts, facts=[]) => { let m=0; for (const p of parts) m=Math.max(m, await count(protectFacts(p.draft,facts).text)); return m; };
+
+  // 触发条件:只有输出可能顶到上限(token×2.5>2048)或放不进上下文才分段,普通草稿走原流程
+  ok(!needsSections(dc,500,640) && !needsSections(dc,819,960) && needsSections(dc,820,960) && needsSections({...dc,ctx_size:1024},300,900), 'needsSections:≤819 token 不分段,820 起分段,上下文放不下也分段');
+  for (const s of fx.samples) {
+    const n = await count(pyStrip(s.draft));
+    ok(!needsSections(dc, n, n+120), `示例草稿「${s.id||s.draft.slice(0,12)}」(${n} token)走原来的单篇流程`);
   }
-  const unicode='你好。😀'.repeat(2400);
+
+  const fact = 'Nadia approved 42 files.';
+  const source = '  '+Array.from({length:12}, (_,i)=>`Section ${i}: ` + 'Nadia approved 42 files. The audit took three weeks. '.repeat(14)).join('\r\n\r\n')+'  \n';
+  const parts = await planDocument(source,[fact],dc,count);
+  ok(parts.length > 1 && joined(parts)===source, '英文:分段拼回去和原稿逐字一致(含 CRLF 空行、首尾空白)');
+  ok(parts.every(p=>!p.draft.includes('HZ_LOCK_')), '段里是原文,不是占位符');
+  ok(await realMax(parts,[fact]) <= SECTION_MAX, `英文:每段实测 token ≤ ${SECTION_MAX}`);
+  ok(parts.slice(0,-1).every(p=>/\n\s*$/.test(p.after)), '英文:段落都不长时,只在空行处分段');
+  ok(parts.reduce((n,p)=>n+p.draft.split(fact).length-1,0) === source.split(fact).length-1, '保留文字出现多少次,分段后一处不少(没有被切开)');
+  const sizes = await Promise.all(parts.map(p=>count(p.draft)));
+  ok(Math.max(...sizes) < 2.2*Math.min(...sizes), `各段大致等长(${Math.min(...sizes)}–${Math.max(...sizes)} token)`);
+
+  // 中文:没有空格的一大段,按句号切;引号跟着句子走
+  const zhSent = '我们在三月十二日完成了第一轮测试，“结果比预期好。”随后团队又花了两周整理数据。';
+  const zh = zhSent.repeat(60);
+  const zp = await planDocument(zh,[],dc,count);
+  ok(zp.length > 1 && joined(zp)===zh, `中文无空格长段:拼回去逐字一致(${zp.length} 段)`);
+  ok(zp.slice(0,-1).every(p=>/[。！？”]$/.test(p.draft)), '中文:只在句末切(句号后的右引号留在前一段)');
+  ok(await realMax(zp) <= SECTION_MAX, '中文:每段实测 token ≤ 上限');
+  // 一句话特别长:退到逗号;连逗号都没有:按字硬切,不切开代理对(emoji)
+  const longSent = ('这是一个没有句号但是有很多逗号的超长句子，' ).repeat(120) + '结束。';
+  const lp = await planDocument(longSent,[],dc,count);
+  ok(lp.length > 1 && joined(lp)===longSent && lp.slice(0,-1).every(p=>/，$/.test(p.draft)), '超长中文句子在逗号处切');
+  const unicode='你好😀'.repeat(1600);
   const up = await planDocument(unicode,[],dc,count);
-  ok(up.length>1 && up.map(p=>p.before+p.draft+p.after).join('')===unicode && up.every(p=>!/[\uD800-\uDBFF]$/.test(p.draft)), 'Unbroken Unicode text splits without losing characters or surrogate pairs');
+  ok(up.length>1 && joined(up)===unicode && up.every(p=>!/[\uD800-\uDBFF]$/.test(p.draft) && !/^[\uDC00-\uDFFF]/.test(p.draft)), '没有任何标点的长串硬切,不切开 emoji 代理对');
+  const enWords = 'word '.repeat(4000).trim();
+  const ep = await planDocument(enWords,[],dc,count);
+  ok(ep.length>1 && joined(ep)===enWords && ep.every(p=>!/^\s|\s$/.test(p.draft)), '只有空格的英文长串在空格处切');
+
+  // 占位符是原子:跨段落的保留文字整段留在一起;保留文字多次出现
   const spanning='One fact\n\ncontinues across paragraphs';
-  const sp=await planDocument('Intro. '+spanning+' '+'more words '.repeat(1400),[spanning],dc,count);
-  ok(sp.some(p=>p.draft.includes(spanning)), 'A fact spanning paragraphs stays inside one section');
-  const padded=' '.repeat(3500)+'Body.';
-  const pp=await planDocument(padded,[],dc,count);
-  ok(pp.map(p=>p.before+p.draft+p.after).join('')===padded, 'Large leading whitespace survives planning');
-  let rejected=false;try { await planDocument('Text',[],{...dc,ctx_size:10},count); } catch(e) {rejected=e.message==='documentContext';}
-  ok(rejected,'Context too small fails instead of silently producing an oversized section');
+  const spSrc='Intro. '+spanning+' '+'more words here. '.repeat(900);
+  const sp=await planDocument(spSrc,[spanning],dc,count);
+  ok(joined(sp)===spSrc && sp.some(p=>p.draft.includes(spanning)), '跨段落的保留文字留在同一段');
+  // 草稿里本来就有 HZ_LOCK_:前缀会换成 _HZ_LOCK_,照样还原
+  const clash = 'Literal [[HZ_LOCK_0]] text. '.repeat(300) + fact;
+  const cp = await planDocument(clash,[fact],dc,count);
+  ok(joined(cp)===clash, '草稿本身含 HZ_LOCK_ 时也逐字还原');
+  // 保留文字在提示词里只占一个占位符:一大段保留文字也不会把段撑大,整段留在一节里
+  const bigFact = 'Clause '.repeat(900).trim()+'.';
+  const bp = await planDocument('Lead in. '+bigFact+' Tail sentence.',[bigFact],dc,count);
+  ok(bp.length===1 && bp[0].draft.includes(bigFact), '超长保留文字不切开(模型只看到占位符)');
+  let rejected=false;try { await planDocument('Some text. '.repeat(50),[],{...dc,ctx_size:200},count); } catch(e) {rejected=e.message==='documentContext';}
+  ok(rejected,'上下文小到一段都放不下:报 documentContext,不交出放不下的段');
+  let empty=false;try { await planDocument(' \n\n ',[],dc,count); } catch(e) {empty=e.message==='documentEmpty';}
+  ok(empty,'只有空白:报错而不是生成空段');
+  // 估算偏小(符号多的文本):按实测比例再切,每段仍不超上限
+  const symCount = async (s) => Math.ceil(s.length/1.5);
+  const sym = '{"k":[1,2,3],"v":"x"} '.repeat(800);
+  const syp = await planDocument(sym,[],dc,symCount);
+  ok(joined(syp)===sym && (await Promise.all(syp.map(p=>symCount(p.draft)))).every(n=>n<=SECTION_MAX), '估算偏小时按实测 token 再切');
+  calls=0; await planDocument(source,[fact],dc,count);
+  ok(calls <= parts.length*3+4, `数 token 的次数和段数同量级(${calls} 次 / ${parts.length} 段)`);
+  // 停止:规划途中取消,抛 AbortError
+  const actl=new AbortController(); actl.abort();
+  let pa='';try { await planDocument(source,[],dc,count,actl.signal); } catch(e) {pa=e.name;}
+  ok(pa==='AbortError','规划途中停止抛 AbortError');
+
+  // 断点
   const sig=documentSignature(dc,'q8');
   const job=newDocumentJob(source,[fact],sig,parts);
-  let calls=0, saved=null;
-  try {await runDocumentSections(job,async(s)=>{calls++;if(calls===2)throw new Error('connection failed');return s;},{onCommit:j=>{saved=JSON.stringify(j);}});} catch {}
-  ok(job.outputs.length===1 && !!saved, 'Failure commits only completed sections');
+  let n=0, saved=null;
+  try {await runDocumentSections(job,async(s)=>{n++;if(n===2)throw new Error('connection failed');return s;},{onCommit:j=>{saved=JSON.stringify(j);}});} catch {}
+  ok(job.outputs.length===1 && !!saved, '出错时只记下已完成的段');
   const loaded=readDocumentJob(saved);
-  ok(!!loaded && jobMatches(loaded,source,[fact],sig) && !jobMatches(loaded,source+'changed',[fact],sig) && !jobMatches(loaded,source,[],sig) && !jobMatches(loaded,source,[fact],documentSignature(dc,'q4')), 'Resume requires matching draft, facts, and model settings');
-  const before=calls;
-  await runDocumentSections(loaded,async(s)=>{calls++;return s;});
-  ok(calls-before===parts.length-1 && combinedDocument(loaded)===source,'Resume skips completed sections and combines the whole document');
+  ok(!!loaded && jobMatches(loaded,source,[fact],sig) && !jobMatches(loaded,source+'changed',[fact],sig) && !jobMatches(loaded,source,[],sig) && !jobMatches(loaded,source,[fact],documentSignature(dc,'q4')) && !jobMatches(loaded,source,[fact],documentSignature({...dc,sampling:{temperature:0.7}},'q8')), '断点只认同一篇草稿 + 同样的保留文字 + 同样的模型和采样');
+  const before=n;
+  const seen=[];
+  await runDocumentSections(loaded,async(s,f,sig2,i)=>{n++;seen.push(i);return s;});
+  ok(n-before===parts.length-1 && seen[0]===1 && combinedDocument(loaded)===source && jobDone(loaded),'续跑从没完成的那段开始,已完成的段不再送进引擎,拼回全文');
   const bad=JSON.parse(saved);bad.outputs[0]='fact missing';
-  ok(readDocumentJob(JSON.stringify(bad))===null && readDocumentJob('{broken')===null,'Corrupt checkpoints or missing saved facts are rejected');
+  const bad2=JSON.parse(saved);bad2.parts[0].draft='tampered';
+  ok(readDocumentJob(JSON.stringify(bad))===null && readDocumentJob(JSON.stringify(bad2))===null && readDocumentJob('{broken')===null && readDocumentJob('null')===null && readDocumentJob(null)===null,'损坏的断点、丢了保留文字的断点一律不认');
   const canceled=newDocumentJob(source,[fact],sig,parts), ctl=new AbortController();
   try {await runDocumentSections(canceled,async(s)=>{ctl.abort();return s;},{signal:ctl.signal});} catch {}
-  ok(canceled.outputs.length===0,'Canceled section is never committed');
+  ok(canceled.outputs.length===0,'停止时正在写的那段不记进断点');
   const lost=newDocumentJob(source,[fact],sig,parts);
-  try {await runDocumentSections(lost,async()=> 'No protected phrase');} catch {}
-  ok(lost.outputs.length===0,'A section losing a fact cannot enter the combined result');
+  let lostErr='';try {await runDocumentSections(lost,async()=> 'No protected phrase');} catch(e) {lostErr=e.message;}
+  ok(lost.outputs.length===0 && lostErr==='factsLost','某段丢了保留文字:不采用、报 factsLost');
+  const blank=newDocumentJob(source,[fact],sig,parts);
+  let blankErr='';try {await runDocumentSections(blank,async()=> '   ');} catch(e) {blankErr=e.message;}
+  ok(blank.outputs.length===0 && blankErr==='documentIncomplete','某段改写为空:不采用');
+  // 每段的保留文字只看这一段里有的(protectFacts 按段做,和单篇一样)
+  const pd0 = protectFacts(parts[0].draft,[fact, 'not in this section']);
+  ok(pd0.facts.length===1 && pd0.text.includes('[[HZ_LOCK_0]]') && !pd0.text.includes(fact), '每段只保护本段里出现的保留文字');
+}
+
+// localStorage 不可用(无痕 / 被禁用 / 抛异常):存取都不崩,断点读出来是 null
+{
+  const desc = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+  Object.defineProperty(globalThis, 'localStorage', { configurable: true, get() { throw new Error('SecurityError'); } });
+  try {
+    let threw=false, job;
+    try {
+      store.set('document', '{"x":1}');
+      job = readDocumentJob(store.get('document', 'null'));
+      addHistory({ id:'x', out:'y' }); loadHistory(); clearHistory();
+    } catch { threw=true; }
+    ok(!threw && job===null, 'localStorage 不可用时存取不抛错,断点为空');
+  } finally {
+    if (desc) Object.defineProperty(globalThis, 'localStorage', desc); else delete globalThis.localStorage;
+  }
 }
 
 if (fails) { console.error(`\n${fails} 项失败`); process.exit(1); }
