@@ -96,3 +96,64 @@ export async function* streamCompletion(body, signal) {
     }
   }
 }
+
+/**
+ * 外部 OpenAI 兼容服务(启动器反代 /api/v1/chat/completions,见 internal/launcher/external.go)。
+ * 把 chat.completion.chunk 流换成和 llama-server /completion 一样的事件:
+ *   { content } …… 最后 { stop: true, stop_type: 'eos' | 'limit', tokens_predicted, timings }
+ * 服务端只发 [DONE]、不给 finish_reason 时按正常结束算;连接中途断开(没有 [DONE] 也没有 finish_reason)不算完成。
+ */
+export async function* streamChat(body, signal) {
+  const r = await fetch('/api/v1/chat/completions', {
+    method: 'POST',
+    headers: { ...H, 'Content-Type': 'application/json', Accept: 'text/event-stream' },
+    body: JSON.stringify(body),
+    signal,
+  });
+  if (!r.ok) {
+    let msg = `HTTP ${r.status}`, type = '';
+    try {
+      const j = await r.json();
+      const e = j.error;
+      msg = (e && (e.message || (typeof e === 'string' ? e : ''))) || j.message || j.detail || msg;
+      type = e?.type || '';
+    } catch { /* 不是 JSON */ }
+    throw Object.assign(new Error(msg), { status: r.status, type, external: true });
+  }
+  const reader = r.body.getReader();
+  const dec = new TextDecoder();
+  const t0 = performance.now();
+  let buf = '', n = 0, finish = null;
+  const final = () => {
+    const secs = (performance.now() - t0) / 1000;
+    return { content: '', stop: true, stop_type: finish === 'length' ? 'limit' : 'eos', tokens_predicted: n,
+      timings: { predicted_per_second: secs > 0 && n ? n / secs : undefined } };
+  };
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    let nl;
+    while ((nl = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, nl).replace(/\r$/, '');
+      buf = buf.slice(nl + 1);
+      if (!line || line.startsWith(':') || !line.startsWith('data:')) continue;
+      const payload = line.slice(5).trim();
+      if (payload === '[DONE]') { yield final(); return; }
+      let ev;
+      try { ev = JSON.parse(payload); } catch { continue; }
+      if (ev.error) throw Object.assign(new Error(ev.error.message || String(ev.error)), { external: true });
+      const ch = ev.choices?.[0];
+      if (!ch) continue;
+      const piece = ch.delta?.content ?? ch.text ?? '';
+      if (piece) { n++; yield { content: piece }; }
+      if (ch.finish_reason) {
+        finish = ch.finish_reason;
+        if (ev.usage?.completion_tokens) n = ev.usage.completion_tokens;
+        yield final();
+        return;
+      }
+    }
+  }
+  if (finish) yield final(); // 理论上走不到;没有 finish_reason 的断流不给 stop 事件
+}

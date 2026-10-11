@@ -129,6 +129,7 @@ func Main(o Options) int {
 
 	a := &App{opts: o, cfg: cfg, dataDir: *dataDir, logger: logger, apiKey: randomKey()}
 	a.settings = loadSettings(a.settingsPath())
+	a.extKey = a.loadExternalKey()
 	if _, ok := cfg.endpoint(a.settings.Endpoint); !ok {
 		a.settings.Endpoint = cfg.Endpoints[0].ID
 	}

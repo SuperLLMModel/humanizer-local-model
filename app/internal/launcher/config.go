@@ -195,6 +195,8 @@ type Settings struct {
 	Port     int    `json:"port,omitempty"`
 	// AutoUpdateCheck:启动后每天最多静默检查一次更新。nil = 没设置过 = 开。
 	AutoUpdateCheck *bool `json:"auto_update_check,omitempty"`
+	// External:改用外部 OpenAI 兼容服务(external.go)。nil = 没设置过 = 用自带引擎。
+	External *ExternalSettings `json:"external,omitempty"`
 }
 
 func loadSettings(path string) Settings {

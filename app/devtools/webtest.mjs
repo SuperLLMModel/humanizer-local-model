@@ -340,5 +340,50 @@ for (const s of fx.samples) {
   }
 }
 
+// 外部 OpenAI 兼容服务:streamChat 把 chat.completion.chunk 换成 /completion 那样的事件
+{
+  const { streamChat } = await import('../web/js/api.js');
+  const originalFetch = globalThis.fetch;
+  const sse = (lines, { ok = true, status = 200, json } = {}) => async (path, opts) => {
+    sse.last = { path, opts };
+    if (!ok) return { ok: false, status, json: async () => json };
+    const enc = new TextEncoder();
+    const body = new ReadableStream({ start(c) { for (const l of lines) c.enqueue(enc.encode(l)); c.close(); } });
+    return { ok: true, status: 200, body };
+  };
+  const collect = async (gen) => { const evs = []; for await (const e of gen) evs.push(e); return evs; };
+  const chunk = (content, fin = null) => `data: ${JSON.stringify({ object: 'chat.completion.chunk', choices: [{ index: 0, delta: content === null ? {} : { content }, finish_reason: fin }] })}\n\n`;
+  try {
+    globalThis.fetch = sse([': keep-alive\n\n', chunk(''), chunk('Hel'), 'data: {"choices":[{"index":0,"delta":{"content":"lo"},"finish_reason":null}]}\r\n\r\n', chunk(null, 'stop'), 'data: [DONE]\n\n']);
+    let evs = await collect(streamChat({ messages: [{ role: 'user', content: 'x' }] }));
+    ok(evs.map((e) => e.content).join('') === 'Hello' && evs.at(-1).stop === true && evs.at(-1).stop_type === 'eos' && evs.at(-1).tokens_predicted === 2, 'streamChat:内容拼对、finish_reason=stop → eos');
+    ok(sse.last.path === '/api/v1/chat/completions' && sse.last.opts.headers['X-Humanizer'] === '1' && JSON.parse(sse.last.opts.body).messages.length === 1, 'streamChat:走启动器反代、带 X-Humanizer 头、请求体原样发出');
+    globalThis.fetch = sse([chunk('a'), chunk('b', 'length')]);
+    evs = await collect(streamChat({}));
+    ok(evs.at(-1).stop_type === 'limit', 'streamChat:finish_reason=length → limit(截断,不采用)');
+    globalThis.fetch = sse([chunk('a'), 'data: [DONE]\n\n']);
+    evs = await collect(streamChat({}));
+    ok(evs.at(-1).stop === true && evs.at(-1).stop_type === 'eos', 'streamChat:只有 [DONE] 没有 finish_reason 也算正常结束');
+    globalThis.fetch = sse([chunk('a'), chunk('b')]);
+    evs = await collect(streamChat({}));
+    ok(!evs.some((e) => e.stop), 'streamChat:半路断流(没有 [DONE] 也没有 finish_reason)不给结束事件');
+    globalThis.fetch = sse([], { ok: false, status: 502, json: { error: { code: 502, type: 'external_unreachable', message: '连不上外部服务' } } });
+    let err; try { await collect(streamChat({})); } catch (e) { err = e; }
+    ok(err?.external && err.status === 502 && err.type === 'external_unreachable', 'streamChat:连不上 → 带 status/type 的错误');
+    globalThis.fetch = sse([], { ok: false, status: 404, json: { error: { message: "model 'x' not found" } } });
+    err = null; try { await collect(streamChat({})); } catch (e) { err = e; }
+    ok(err?.status === 404 && /not found/.test(err.message), 'streamChat:模型名不对 → 404 + 服务端原话');
+    globalThis.fetch = sse(['data: {"error":{"message":"boom"}}\n\n']);
+    err = null; try { await collect(streamChat({})); } catch (e) { err = e; }
+    ok(err?.external && err.message === 'boom', 'streamChat:流里的 error 事件抛出');
+  } finally { globalThis.fetch = originalFetch; }
+
+  globalThis.document = { documentElement: { getAttribute: () => 'en' } };
+  const { pickModel, describeTest } = await import('../web/js/external.js');
+  ok(pickModel(['a', 'humanizer-12b-q8_0', 'b']) === 'humanizer-12b-q8_0' && pickModel(['only']) === 'only' && pickModel(['a', 'b']) === '' && pickModel([]) === '', 'pickModel:优先名字带 humanizer 的,只有一个就用它,猜不出就留空');
+  const d1 = describeTest({ ok: false, code: 'auth' }), d2 = describeTest({ ok: false, code: 'unreachable', url: 'http://localhost:1234/v1' }), d3 = describeTest({ ok: true, models: ['m'] });
+  ok(d1.kind === 'err' && /API key/.test(d1.text) && /localhost:1234/.test(d2.text) && d3.kind === 'ok', 'describeTest:key 错 / 连不上 / 连上了 各有一句说明');
+}
+
 if (fails) { console.error(`\n${fails} 项失败`); process.exit(1); }
 console.log('\n全部通过');

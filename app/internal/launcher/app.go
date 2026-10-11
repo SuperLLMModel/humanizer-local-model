@@ -60,6 +60,7 @@ type App struct {
 	port     int
 	url      string
 	apiKey   string // llama-server 的访问密钥,每次启动随机生成,只有启动器的反代知道
+	extKey   string // 外部服务的 API key(external.go),从数据目录读,只在启动器里用
 
 	rootCtx  context.Context
 	shutdown context.CancelFunc
@@ -113,6 +114,13 @@ func (a *App) setError(kind, code, msg, detail string) {
 // boot 决定开机状态:选过的档位已下载 → 直接起引擎;有半截文件 → 暂停态;
 // 什么都没有 → 等用户在网页上选档。
 func (a *App) boot() {
+	a.mu.Lock()
+	ext := a.externalOn()
+	a.mu.Unlock()
+	if ext { // 用外部服务:自带引擎不启动、不下载
+		a.enterExternal()
+		return
+	}
 	rec := a.cfg.recommendTier(a.sys.RAMGB)
 	id := a.settings.Tier
 	if _, ok := a.cfg.tier(id); !ok {
@@ -172,6 +180,11 @@ func tierIDs(ts []Tier) []string {
 
 func (a *App) startEngine(t Tier) {
 	a.mu.Lock()
+	if a.externalOn() { // 外部服务模式下(比如后台下载/模型更新刚做完)不拉起自带引擎
+		a.tier = t.ID
+		a.mu.Unlock()
+		return
+	}
 	if a.engineCancel != nil {
 		a.engineCancel()
 	}

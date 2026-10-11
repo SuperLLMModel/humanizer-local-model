@@ -251,3 +251,34 @@
   .seg { margin: 0 2px; }
   .seg button { min-width: 30px; padding: 0 6px; }
 }
+
+/* ───────── 外部模型服务(js/external.js,借用更新面板的外框)───────── */
+.ext { width: min(560px, calc(100vw - 32px)); }
+.ext-lede { margin: 0 0 18px; font-size: 13.5px; line-height: 1.6; color: var(--ink-2); }
+.ext-switch { margin-bottom: 18px; }
+.ext-field { display: grid; gap: 6px; margin-bottom: 14px; font-size: 12.5px; color: var(--ink-3); }
+.ext-field input {
+  width: 100%; height: 38px; padding: 0 12px; border-radius: 10px; border: 1px solid var(--line); background: var(--sheet);
+  font-family: var(--f-mono); font-size: 12.5px; color: var(--ink); min-width: 0;
+}
+.ext-field input:focus { outline: none; border-color: var(--ink-3); box-shadow: 0 0 0 3px var(--hl-ring); }
+.ext-field input:disabled { opacity: .55; }
+.ext-key-row { display: flex; gap: 6px; }
+.ext-key-row .btn { flex: none; height: 38px; }
+.ext-result {
+  margin: 4px 0 6px; padding: 10px 14px; border-radius: 12px; font-size: 13px; line-height: 1.5; overflow-wrap: anywhere;
+  background: var(--sunk); color: var(--ink-2); border: 1px solid var(--line-2);
+}
+.ext-result.ok { border-color: color-mix(in srgb, var(--ok) 45%, transparent); background: color-mix(in srgb, var(--ok) 8%, var(--sheet)); color: var(--ink); }
+.ext-result.err { border-color: color-mix(in srgb, var(--err) 45%, transparent); background: color-mix(in srgb, var(--err) 8%, var(--sheet)); color: var(--ink); }
+#ext-test { display: inline-flex; align-items: center; gap: 8px; white-space: nowrap; }
+#ext-test svg { width: 16px; height: 16px; }
+#ext-test.spinning svg { animation: spin .9s linear infinite; }
+.ext .upd-foot .grow { flex: 1; }
+.ext-badge { background: var(--sunk); color: var(--ink-2); box-shadow: inset 0 0 0 1px var(--line); }
+.ext-link { display: inline-flex; align-items: center; gap: 8px; width: 100%; justify-content: center; margin-top: 10px; font-size: 12.5px; height: auto; min-height: 36px; padding: 6px 12px; white-space: normal; }
+.ext-link svg { width: 16px; height: 16px; flex: none; }
+@media (max-width: 560px) {
+  .ext { width: 100%; }
+  .ext .upd-foot .btn { flex: 1 1 auto; justify-content: center; }
+}

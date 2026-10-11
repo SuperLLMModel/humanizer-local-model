@@ -1,6 +1,7 @@
 // Humanizer 网页主控:状态轮询 → 视图切换(首次下载 / 编辑器)→ 改写流式输出 → 差异与历史。
 import { t, apply, setLang, getLang } from './i18n.js';
-import { getJSON, postJSON, countTokens, streamCompletion } from './api.js';
+import { getJSON, postJSON, countTokens, streamCompletion, streamChat } from './api.js';
+import { bindExternal, openExternal, refreshExternal } from './external.js';
 import { buildPrompt, selfCheck, nPredictFor } from './prompt.js';
 import { withLangGuard, langDrift } from './guard.js';
 import { tokenize, diffTokens, markBits, factBits, renderRuns, flagNumbers } from './diff.js';
@@ -135,6 +136,20 @@ function tierOf(id) {
   return S.status?.tiers?.find((x) => x.id === id);
 }
 
+// 外部服务模式(external.js / 启动器 external.go):改写走 OpenAI 兼容的 /chat/completions,不数 token
+const extOn = () => !!S.status?.external?.enabled;
+const engineLabel = () => (extOn() ? S.status.external.model || t('ext.status') : tierOf(S.status?.tier)?.label);
+const engineId = () => (extOn() ? 'external' : S.status?.tier);
+
+/** 外部服务的错误换成说人话的提示(连不上 / key 不对 / 模型名不对)。 */
+function externalMessage(e) {
+  const url = S.status?.external?.url || '';
+  if (e.type === 'external_unreachable' || e.status === 502) return t('ext.errUnreachable', { url });
+  if (e.status === 401 || e.status === 403) return t('ext.errAuth');
+  if (e.status === 404 || /model/i.test(e.message)) return t('ext.errModel', { msg: e.message });
+  return t('ext.errOther', { msg: e.message });
+}
+
 function renderBrand() {
   const tier = tierOf(S.status?.tier);
   const name = '12B';
@@ -149,7 +164,8 @@ function renderStatus() {
     case 'ready': {
       state = 'ready';
       const be = BACKEND[st.engine?.backend] || st.engine?.backend || '';
-      text = S.running ? t('status.writing') : [t('status.ready'), tier?.label, be].filter(Boolean).join(' · ');
+      const parts = extOn() ? [t('status.ready'), t('ext.status'), st.external.model] : [t('status.ready'), tier?.label, be];
+      text = S.running ? t('status.writing') : parts.filter(Boolean).join(' · ');
       break;
     }
     case 'starting': state = 'busy'; text = [t('status.loading'), tier?.label].filter(Boolean).join(' · '); break;
@@ -357,6 +373,16 @@ function renderPop() {
   $('pi-ctx').textContent = `${fmtNum(st.ctx_size, getLang())} tokens`;
   $('pi-idle').textContent = st.idle_exit_minutes > 0 ? t('menu.idle', { n: st.idle_exit_minutes }) : '';
   $('pa-restart').hidden = !['ready', 'starting', 'error'].includes(st.phase);
+  const ext = extOn();
+  $('pa-external-badge').hidden = !ext;
+  $('pa-tier').hidden = ext;
+  if (ext) {
+    $('pi-model').textContent = st.external.model || '—';
+    $('pi-engine').textContent = t('ext.engine');
+    $('pi-device').textContent = st.external.url;
+    $('pi-ctx').textContent = t('ext.ctxGuess', { n: fmtNum(st.ctx_size, getLang()) });
+    $('pa-restart').hidden = true;
+  }
 }
 
 function togglePop(force) {
@@ -421,6 +447,7 @@ function updateGo() {
   renderCopyButton();
   $('btn-download-text').disabled = S.running || !S.result;
   updateDocumentProgress();
+  refreshExternal();
   $('out-empty-sub').innerHTML = t('out.emptySub', { key: KEY_LABEL });
 }
 
@@ -496,7 +523,9 @@ function showReading(note, p) {
 }
 
 // token 数:引擎 /tokenize(不加 BOS)。停止 / 超时照常抛出;其他错误(比如接口不可用)退回按字数估算。
+// 外部服务没有 /tokenize,直接按字数估算(偏保守)。
 async function tokensOf(text, signal) {
+  if (extOn()) return approxTokens(text);
   try { return await countTokens(text, { signal }); } catch (e) {
     if (signal?.aborted || e.name === 'AbortError' || e.name === 'TimeoutError') throw e;
     return approxTokens(text);
@@ -518,6 +547,17 @@ async function generate(draft, pd, nPred, signal) {
     cache_prompt: true,
     return_progress: true,
   };
+  // 外部服务:同样的草稿(带占位符)作为唯一一条 user 消息,不带 system;GGUF 自带的模板拼出同一个提示词。
+  // 采样参数和自带引擎一样(temperature 1.0、top_p 0.95,其余关掉),和 docs/USAGE.md 第 8 节一致。
+  const ext = extOn() ? S.status.external : null;
+  const chatBody = ext && {
+    ...(ext.model ? { model: ext.model } : {}),
+    messages: [{ role: 'user', content: pyStrip(pd.text) }],
+    ...S.cfg.sampling,
+    max_tokens: nPred,
+    stream: true,
+  };
+  const open = (sig) => (ext ? streamChat(chatBody, sig) : streamCompletion(body, sig));
   const locked = pd.locks.length > 0;
   S.protect = locked ? pd : null;
   let note = '';
@@ -530,7 +570,7 @@ async function generate(draft, pd, nPred, signal) {
     S.out = '';
     if (i > 0) showReading(note, 0);
     try {
-      for await (const ev of streamCompletion(body, ctl.signal)) {
+      for await (const ev of open(ctl.signal)) {
         if (ev.prompt_progress && !S.out) {
           const pp = ev.prompt_progress;
           showReading(note, pp.total ? Math.round((100 * pp.processed) / pp.total) : 0);
@@ -616,6 +656,7 @@ async function run() {
   } catch (e) {
     if (e.name === 'AbortError') aborted = true;
     else if (e.name === 'TimeoutError') error = Object.assign(new Error(t('out.requestTimeout')), { notice: true });
+    else if (e.external) error = Object.assign(new Error(externalMessage(e)), { notice: true });
     else error = e;
     if (S.protect) S.out = ''; // 有保护段时,没核对过的半截结果不显示(可能缺原文)
   }
@@ -648,7 +689,7 @@ async function run() {
       else if (factTries > 1) showNotice('', t('facts.retried', { n: factTries }));
       addHistory({
         id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
-        t: Date.now(), draft, facts: protectedDraft.facts, out: text, tier: S.status?.tier, tierLabel: tierOf(S.status?.tier)?.label, tok, tps,
+        t: Date.now(), draft, facts: protectedDraft.facts, out: text, tier: engineId(), tierLabel: engineLabel(), tok, tps,
         ratio: S.result.diff ? S.result.diff.ratio : null, stop: final.stop_type,
       });
     } else if (aborted) {
@@ -665,7 +706,7 @@ async function run() {
 // ───────────────────────── 长文分段改写(document.js)─────────────────────────
 // 断点存在浏览器 localStorage(hz.document),每完成一段存一次;草稿或保留段一改就作废,模型/设置变了不能接着用。
 // 分段改写进行中草稿框只读(停止后恢复),免得改到一半的草稿和断点对不上。
-const engineSignature = () => documentSignature(S.cfg, S.status?.tier || '');
+const engineSignature = () => documentSignature(S.cfg, extOn() ? `ext|${S.status.external.url}|${S.status.external.model || ''}` : S.status?.tier || '');
 
 function resumableJob(draft) {
   const job = S.docJob;
@@ -795,7 +836,7 @@ async function runDocument(draft, resume) {
     $('out-stats').textContent = t('out.stats', { tok: fmtNum(tok, getLang()), tps: tps ? tps.toFixed(1) : '—', sec: secs.toFixed(1) });
     addHistory({
       id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
-      t: Date.now(), draft, facts, out: text, tier: S.status?.tier, tierLabel: tierOf(S.status?.tier)?.label, tok, tps: tps || undefined,
+      t: Date.now(), draft, facts, out: text, tier: engineId(), tierLabel: engineLabel(), tok, tps: tps || undefined,
       ratio: S.result.diff ? S.result.diff.ratio : null, stop: 'eos', sections: job.parts.length,
     });
     renderResult();
@@ -806,9 +847,10 @@ async function runDocument(draft, resume) {
     let msg;
     if (aborted) msg = S.docJob?.outputs.length ? t('document.stopped', { key: KEY_LABEL }) : t('out.stopped');
     else if (error.name === 'TimeoutError') msg = t('out.requestTimeout');
+    else if (error.external) msg = escapeHTML(externalMessage(error));
     else if (DOC_ERRORS[error.message]) msg = t(DOC_ERRORS[error.message], { n: FACT_TRIES });
     else msg = t('out.failed', { msg: escapeHTML(error.message) });
-    if (!aborted && S.docJob) msg += ' ' + t('document.resumeHint');
+    if (!aborted && S.docJob) msg += ' ' + t(S.docJob.outputs.length ? 'document.resumeHint' : 'document.retryHint');
     showNotice(aborted ? '' : 'warn', msg + storageNote);
   }
   updateDocumentProgress();
@@ -1301,6 +1343,13 @@ function bind() {
       if ($('drawer').classList.contains('open')) renderHistory();
     });
   }
+  $('pa-external').addEventListener('click', (e) => { e.stopPropagation(); togglePop(false); openExternal(true, $('btn-menu')); });
+  $('btn-setup-external').addEventListener('click', () => openExternal(true));
+  bindExternal({
+    isRunning: () => S.running,
+    toast,
+    onChange: () => { S.forceSetup = false; S.tierSig = ''; poll(); },
+  });
   $('pa-tier').addEventListener('click', () => { togglePop(false); S.forceSetup = true; S.pickTier = S.status?.tier; S.tierSig = ''; render(); });
   $('pa-reveal').addEventListener('click', () => postJSON('/app/reveal', { what: 'models' }).then(() => toast(t('toast.revealed'))).catch((e) => toast(e.message)));
   $('pa-restart').addEventListener('click', async () => { togglePop(false); toast(t('toast.restarting')); await postJSON('/app/engine/restart', {}, { timeout: SLOW_POST_MS }).catch((e) => toast(e.message)); poll(); });

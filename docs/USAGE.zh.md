@@ -397,6 +397,8 @@ print(json.load(urllib.request.urlopen(req, timeout=900))["choices"][0]["text"].
 
 如果聊天回复以“Sure”开头、复述指令或者停不下来，说明文件里没有自带模板（2026-10-04 以前下载的），或者模型设置里的提示词模板被改过：重新下载文件、把模板恢复原样，或者改用 `/v1/completions`。如果你的 LM Studio 版本不认请求里的 `top_k`、`min_p`、`repeat_penalty`，第 2 步的设置会生效。
 
+**接到 Humanizer App 上**（App 0.3.4 起）：模型已经在 LM Studio 里加载好了，就不用让 App 再下载、再起一个引擎。在 LM Studio 的 Developer 页打开本地服务，然后在 App 右上角「…」→「外部模型服务」（第一次打开 App 时，选档页下面也有入口）里打开「使用外部服务」，地址填 `http://localhost:1234/v1`，点「测试连接」，模型名会自动填上（服务上有好几个模型时自己挑 humanizer 那个），再点「保存」。之后 App 不再启动自带的 llama.cpp，改写经 App 转到 LM Studio 的 `/chat/completions`（流式）：草稿是唯一一条 user 消息，不带 system，temperature 1.0、top_p 0.95（另带 top_k 0、min_p 0、repeat_penalty 1.0，和上面第 2 步一样），所以要用 2026-10-04 及之后下载的、自带模板的文件。原样保留（Create fact）、语言检查、长文分段都照常工作；外部服务不能数 token，长度按字数估算。别的 OpenAI 兼容服务（llama-server、Ollama 的 `http://localhost:11434/v1`、vLLM）同样可以填；需要 key 的话填在 API key 里，只存在本机。关掉开关就恢复自带引擎，已下载的模型不受影响。连不上、key 不对、模型名不对，改写区会直接说是哪一种。
+
 ## 9. 批量改写一个文件夹
 
 `humanize_folder.py` 通过正在运行的 llama-server（见[第 3 节](#起服务)），把一个文件夹里的每个 `.txt` 改写到另一个文件夹。只用标准库。

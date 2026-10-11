@@ -388,7 +388,7 @@ func (e appEngine) usesTier(id string) bool {
 	a := e.a
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if a.tier != id {
+	if a.tier != id || a.externalOn() {
 		return false
 	}
 	return a.phase == phaseStarting || a.phase == phaseReady ||

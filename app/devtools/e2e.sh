@@ -32,7 +32,7 @@ alive() { kill -0 "$1" 2>/dev/null; }
 
 "$OUT/fakehf" -addr 127.0.0.1:9182 -size 24 -rate 12 -drop-at 5 > "$W/fakehf.log" 2>&1 &
 HF=$!
-trap 'quit 47720; quit 47721; quit 47722; kill $HF 2>/dev/null || true' EXIT
+trap 'quit 47720; quit 47721; quit 47722; kill $HF ${EXT:-} 2>/dev/null || true' EXIT
 
 echo "1. 首次运行:选档 → 下载(中途断线)→ 暂停 → 续传 → 校验 → 起引擎"
 "$OUT/humanizer" --data-dir "$W/d1" --engine "metal=$FAKE" --base-url http://127.0.0.1:9182 --no-browser --port 47720 --idle-exit 0 > "$W/l1.log" 2>&1 &
@@ -130,6 +130,35 @@ check "显示已下载的字节数" '[ "$(st 47720 | field "d[\"download\"][\"re
 post 47720 /app/setup '{"tier":"q6"}' >/dev/null
 wait_phase 47720 ready 30 && ok "续传完成并就绪" || bad "续传完成并就绪"
 check "续传是从断点开始的" 'grep -q "从 [1-9][0-9]* 字节处续传" "$W/l6.log"'
+quit 47720; sleep 1
+
+echo "8. 外部服务(OpenAI 兼容):不起自带引擎、改写经启动器反代过去;重启后照旧;关掉恢复自带引擎"
+LLAMA_API_KEY=sk-e2e "$FAKE" --port 9311 > "$W/ext.log" 2>&1 &
+EXT=$!
+mkdir -p "$W/d4/models"; printf 'GGUF' > "$W/d4/models/humanizer-12b-Q8_0.gguf"; echo '{"tier":"q8"}' > "$W/d4/settings.json"
+"$OUT/humanizer" --data-dir "$W/d4" --engine "metal=$FAKE" --no-browser --port 47720 --idle-exit 0 > "$W/l7.log" 2>&1 &
+wait_phase 47720 ready 20 && ok "自带引擎先就绪" || bad "自带引擎先就绪"
+check "测试连接:key 不对报 auth" 'post 47720 /app/external/test "{\"url\":\"127.0.0.1:9311\",\"api_key\":\"nope\"}" | grep -q "\"code\":\"auth\""'
+check "测试连接:拿到模型列表" 'post 47720 /app/external/test "{\"url\":\"127.0.0.1:9311\",\"api_key\":\"sk-e2e\"}" | grep -q humanizer-12b-q8_0'
+post 47720 /app/external '{"enabled":true,"url":"http://127.0.0.1:9311/v1/chat/completions","model":"humanizer-12b-q8_0","api_key":"sk-e2e"}' >/dev/null
+sleep 0.5
+check "开启后直接就绪,backend=external,地址已规范化" '[ "$(st 47720 | field "d[\"phase\"]+\"/\"+d[\"engine\"][\"backend\"]+\"/\"+d[\"external\"][\"url\"]")" = "ready/external/http://127.0.0.1:9311/v1" ]'
+check "自带引擎进程已经停了" '! pgrep -f "$W/d4/models/humanizer-12b-Q8_0.gguf" >/dev/null'
+check "API key 存成 0600 文件,不在 settings.json 和状态里" '[ "$(python3 -c "import os,sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o777))" "$W/d4/external-api-key")" = 0o600 ] && ! grep -q sk-e2e "$W/d4/settings.json" && ! st 47720 | grep -q sk-e2e'
+SSE=$(curl -s -N -m 20 -X POST -H 'X-Humanizer: 1' -H 'Content-Type: application/json' http://127.0.0.1:47720/api/v1/chat/completions \
+  -d '{"model":"humanizer-12b-q8_0","messages":[{"role":"user","content":"A short draft. It has two sentences."}],"temperature":1.0,"top_p":0.95,"max_tokens":256,"stream":true}')
+check "流式改写经启动器反代到外部服务(带 key,收尾 [DONE])" 'echo "$SSE" | grep -q "chat.completion.chunk" && echo "$SSE" | grep -q "data: \[DONE\]" && grep -q "CHAT .*msgs=1" "$W/ext.log"'
+check "外部模式只放行 chat/completions(/api/tokenize 404)" '[ "$(curl -s -o /dev/null -w "%{http_code}" -X POST -H "X-Humanizer: 1" http://127.0.0.1:47720/api/tokenize -d "{}")" = 404 ]'
+check "外部模式下换档被拒(409)" '[ "$(curl -s -o /dev/null -w "%{http_code}" -X POST -H "X-Humanizer: 1" http://127.0.0.1:47720/app/setup -d "{\"tier\":\"q8\"}")" = 409 ]'
+quit 47720; sleep 1
+"$OUT/humanizer" --data-dir "$W/d4" --engine "metal=$FAKE" --no-browser --port 47720 --idle-exit 0 > "$W/l8.log" 2>&1 &
+wait_phase 47720 ready 10 && ok "重启后直接就绪" || bad "重启后直接就绪"
+check "重启后仍走外部服务,没有拉起自带引擎" '[ "$(st 47720 | field "d[\"engine\"][\"backend\"]")" = external ] && ! grep -q "启动引擎" "$W/l8.log"'
+{ kill $EXT; wait $EXT; } 2>/dev/null || true
+check "外部服务挂了:502 + external_unreachable" 'curl -s -X POST -H "X-Humanizer: 1" http://127.0.0.1:47720/api/v1/chat/completions -d "{}" | grep -q external_unreachable'
+post 47720 /app/external '{"enabled":false,"url":"http://127.0.0.1:9311/v1"}' >/dev/null
+wait_phase 47720 ready 20 && sleep 0.3
+check "关掉外部服务:恢复自带引擎" '[ "$(st 47720 | field "d[\"engine\"][\"backend\"]")" = metal ] && grep -q "启动引擎" "$W/l8.log"'
 quit 47720; sleep 1
 
 echo

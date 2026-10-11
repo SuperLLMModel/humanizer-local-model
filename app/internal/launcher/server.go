@@ -33,6 +33,9 @@ func (a *App) handler() http.Handler {
 	mux.HandleFunc("POST /app/engine/restart", a.handleRestart)
 	mux.HandleFunc("POST /app/reveal", a.handleReveal)
 	mux.HandleFunc("POST /app/quit", a.handleQuit)
+	mux.HandleFunc("GET /app/external", a.handleExternalGet)
+	mux.HandleFunc("POST /app/external", a.handleExternalSet)
+	mux.HandleFunc("POST /app/external/test", a.handleExternalTest)
 	a.registerUpdateRoutes(mux)
 	mux.Handle("/api/", a.countInflight(a.apiProxy()))
 	mux.Handle("/", a.static())
@@ -113,6 +116,22 @@ func (a *App) apiProxy() http.Handler {
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		sub := strings.TrimPrefix(r.URL.Path, "/api")
+		a.mu.Lock()
+		ext, extKey := a.externalOn(), a.extKey
+		var extURL string
+		if ext {
+			extURL = a.settings.External.URL
+		}
+		a.mu.Unlock()
+		if ext { // 外部服务:只放行流式改写这一个接口(/tokenize 等不存在,网页按字数估算)
+			base, err := url.Parse(extURL)
+			if sub != "/v1/chat/completions" || r.Method != http.MethodPost || err != nil {
+				http.NotFound(w, r)
+				return
+			}
+			a.externalProxy(base, extKey).ServeHTTP(w, r)
+			return
+		}
 		if !apiAllow[sub] {
 			http.NotFound(w, r)
 			return
@@ -161,22 +180,23 @@ type dlStatus struct {
 }
 
 type statusResp struct {
-	App             string       `json:"app"`
-	Version         string       `json:"version"`
-	Phase           string       `json:"phase"`
-	Sys             SysInfo      `json:"sys"`
-	Recommended     string       `json:"recommended"`
-	Tier            string       `json:"tier"`
-	Endpoint        string       `json:"endpoint"`
-	Tiers           []tierStatus `json:"tiers"`
-	Endpoints       []Endpoint   `json:"endpoints"`
-	Download        *dlStatus    `json:"download,omitempty"`
-	Engine          *engineInfo  `json:"engine,omitempty"`
-	Backends        []string     `json:"backends"`
-	Error           *errInfo     `json:"error,omitempty"`
-	DataDir         string       `json:"data_dir"`
-	IdleExitMinutes int          `json:"idle_exit_minutes"`
-	CtxSize         int          `json:"ctx_size"`
+	App             string          `json:"app"`
+	Version         string          `json:"version"`
+	Phase           string          `json:"phase"`
+	Sys             SysInfo         `json:"sys"`
+	Recommended     string          `json:"recommended"`
+	Tier            string          `json:"tier"`
+	Endpoint        string          `json:"endpoint"`
+	Tiers           []tierStatus    `json:"tiers"`
+	Endpoints       []Endpoint      `json:"endpoints"`
+	Download        *dlStatus       `json:"download,omitempty"`
+	Engine          *engineInfo     `json:"engine,omitempty"`
+	Backends        []string        `json:"backends"`
+	Error           *errInfo        `json:"error,omitempty"`
+	DataDir         string          `json:"data_dir"`
+	IdleExitMinutes int             `json:"idle_exit_minutes"`
+	CtxSize         int             `json:"ctx_size"`
+	External        *externalStatus `json:"external"`
 	// Notice:"lite_retired" = 这台机器以前选的是已下线的 lite 档,网页提示换成推荐的 12B 档位;旧文件不删。
 	Notice string `json:"notice,omitempty"`
 }
@@ -204,6 +224,7 @@ func (a *App) handleStatus(w http.ResponseWriter, r *http.Request) {
 	a.mu.Lock()
 	s.Phase = a.phase
 	s.Tier = a.tier
+	s.External = a.externalStatusLocked()
 	s.Endpoint = a.settings.Endpoint
 	if _, ok := a.cfg.tier(a.settings.Tier); !ok && a.settings.Tier == "lite" {
 		s.Notice = "lite_retired"
@@ -264,6 +285,13 @@ func (a *App) handleSetup(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]any{"error": "unknown tier"})
 		return
 	}
+	a.mu.Lock()
+	ext := a.externalOn()
+	a.mu.Unlock()
+	if ext {
+		writeJSON(w, 409, map[string]any{"error": "external service is on", "code": "external_on"})
+		return
+	}
 	if req.Endpoint == "" {
 		req.Endpoint = a.settings.Endpoint
 	}
@@ -304,7 +332,12 @@ func (a *App) handleRestart(w http.ResponseWriter, r *http.Request) {
 	a.mu.Lock()
 	t, ok := a.cfg.tier(a.tier)
 	a.restarts = 0
+	ext := a.externalOn()
 	a.mu.Unlock()
+	if ext {
+		writeJSON(w, 409, map[string]any{"error": "external service is on", "code": "external_on"})
+		return
+	}
 	if !ok || !fileExists(a.modelPath(t)) {
 		writeJSON(w, 409, map[string]any{"error": "no model"})
 		return

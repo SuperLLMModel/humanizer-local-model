@@ -18,6 +18,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -142,6 +143,11 @@ func main() {
 		json.NewEncoder(w).Encode(map[string]any{"tokens": toks})
 	})
 	mux.HandleFunc("POST /completion", completion)
+	// OpenAI 兼容接口(真 llama-server / LM Studio 都有):测 App 的「外部服务」模式
+	mux.HandleFunc("GET /v1/models", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{"object": "list", "data": []map[string]any{{"id": "humanizer-12b-q8_0", "object": "model"}}})
+	})
+	mux.HandleFunc("POST /v1/chat/completions", chatCompletion)
 	// 和真 llama-server 一样:设了 LLAMA_API_KEY 就校验(/health 例外)
 	var handler http.Handler = mux
 	if key := os.Getenv("LLAMA_API_KEY"); key != "" {
@@ -343,4 +349,103 @@ func synth(draft string) string {
 		paras[i] = strings.Join(sents, sep)
 	}
 	return "(fake) " + strings.Join(paras, "\n\n")
+}
+
+// chatCompletion:OpenAI 兼容的流式 /v1/chat/completions。按 App 的约定校验:只有一条 user 消息(草稿)、
+// 没有 system、temperature 1.0 / top_p 0.95;不对就 400,这样网页发错了格式测试会失败。
+func chatCompletion(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Model       string            `json:"model"`
+		Messages    []json.RawMessage `json:"messages"`
+		Temperature *float64          `json:"temperature"`
+		TopP        *float64          `json:"top_p"`
+		MaxTokens   int               `json:"max_tokens"`
+		Stream      bool              `json:"stream"`
+	}
+	raw, _ := io.ReadAll(r.Body)
+	if err := json.Unmarshal(raw, &req); err != nil {
+		http.Error(w, `{"error":{"message":"bad json"}}`, 400)
+		return
+	}
+	var params map[string]any
+	json.Unmarshal(raw, &params)
+	delete(params, "messages")
+	pj, _ := json.Marshal(params)
+	var msgs []struct{ Role, Content string }
+	for _, m := range req.Messages {
+		var x struct{ Role, Content string }
+		json.Unmarshal(m, &x)
+		msgs = append(msgs, x)
+	}
+	sum := sha256.Sum256(raw)
+	fmt.Fprintf(os.Stderr, "CHAT sha=%s msgs=%d params=%s\n", hex.EncodeToString(sum[:])[:16], len(msgs), pj)
+	fail := func(msg string) {
+		w.WriteHeader(400)
+		b, _ := json.Marshal(map[string]any{"error": map[string]any{"message": msg, "type": "invalid_request_error"}})
+		w.Write(b)
+	}
+	if want := os.Getenv("FAKE_MODEL"); want != "" && req.Model != want {
+		w.WriteHeader(404)
+		w.Write([]byte(`{"error":{"message":"model '` + req.Model + `' not found","type":"invalid_request_error"}}`))
+		return
+	}
+	if len(msgs) != 1 || msgs[0].Role != "user" {
+		fail("fake: expected exactly one user message and no system message")
+		return
+	}
+	if req.Temperature == nil || *req.Temperature != 1 || req.TopP == nil || *req.TopP != 0.95 {
+		fail("fake: expected temperature 1.0 and top_p 0.95")
+		return
+	}
+	draft := msgs[0].Content
+	out, ok := fixtures[strings.TrimSpace(draft)]
+	if !ok {
+		out = synth(draft)
+	}
+	if lockRe.MatchString(draft) {
+		n := lockCalls.Add(1)
+		if m := os.Getenv("FAKE_LOCKS"); m == "drop" || (m == "flaky" && n%2 == 1) {
+			out = lockRe.ReplaceAllString(out, "")
+		}
+	}
+	pieces := split(out)
+	finish := "stop"
+	if req.MaxTokens > 0 && len(pieces) > req.MaxTokens {
+		pieces, finish = pieces[:req.MaxTokens], "length"
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	fl, _ := w.(http.Flusher)
+	send := func(v any) bool {
+		b, _ := json.Marshal(v)
+		if _, err := fmt.Fprintf(w, "data: %s\n\n", b); err != nil {
+			return false
+		}
+		if fl != nil {
+			fl.Flush()
+		}
+		return true
+	}
+	chunk := func(delta map[string]any, fin any) map[string]any {
+		return map[string]any{"id": "chatcmpl-fake", "object": "chat.completion.chunk", "model": req.Model,
+			"choices": []map[string]any{{"index": 0, "delta": delta, "finish_reason": fin}}}
+	}
+	send(chunk(map[string]any{"role": "assistant", "content": ""}, nil))
+	for _, p := range pieces {
+		select {
+		case <-r.Context().Done():
+			fmt.Fprintln(os.Stderr, "fake: chat client disconnected, stop generating")
+			return
+		default:
+		}
+		if !send(chunk(map[string]any{"content": p}, nil)) {
+			return
+		}
+		time.Sleep(tokenDelay)
+	}
+	send(chunk(map[string]any{}, finish))
+	fmt.Fprint(w, "data: [DONE]\n\n")
+	if fl != nil {
+		fl.Flush()
+	}
 }

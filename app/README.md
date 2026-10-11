@@ -46,6 +46,7 @@
 - **导入 .docx / .pdf**(0.3.2,外部贡献 PR #2):草稿底栏「导入」或把文件拖到草稿上。网页把文件 POST 到 `/app/document`(同样要带 `X-Humanizer` 头),启动器在内存里提取文字、不落盘,最大 20 MB、500 页、2 MB 文字。DOCX 只取正文段落和表格(页眉页脚、批注、图片不要),段落之间空一行,和模型训练时草稿的分段一致;表格一行一行、单元格用 Tab 隔开。PDF 由 `github.com/ledongthuc/pdf` 解析文件结构,解码和排版在 `document_pdf.go` 自己做:库只在 Identity-H 时才用 ToUnicode,Chrome / Skia 打印的中文 PDF(Type3 字体 + Differences + ToUnicode)会整篇乱码;库按文字对象一行一换行,英文段落会被切碎。这里只要有 ToUnicode 就用,按文字矩阵算坐标拼行,行距明显变大、字号变化、上一行是短句收尾才分段,没写满又不是句末的短行(落款、地址、列表项)保留换行,段内英文行用空格接回、中文行直接接上;再把 Chrome 写成部首码位的字(⼀ U+2F00、⻋ U+2ECB 等,对照表来自 Unicode EquivalentUnifiedIdeograph.txt)和连字 ﬁ 归一。控制字符/替换符/私用区字符超过 5% 就报「编码认不出来」,不把乱码塞进草稿。扫描版 PDF 没有文字层,提示先 OCR。提取期间草稿被改过就不覆盖。
 - **长文档提示**(0.3.2):草稿估算超过约 1,000 token(≈ 700 个英文词 / 1,100 个汉字,`text.js` 的 `LONG_DRAFT_TOKENS`)时,草稿框底部显示一条提示:长文档改写可能出现事实偏差,建议检查结果,或让 AI 把改错的地方纠正一下。门槛的依据:评测集最长的草稿约 450 词;草稿过了约 820 token,输出就顶到 n_predict 上限 2,048。
 - **长文分段改写**(0.3.4,外部贡献 PR #5):草稿 token × 2.5 超过单次输出上限 2,048(约 820 token 以上,也就是以前提示「结尾可能被截断,建议分段」的那条线),或提示词 + 输出放不进上下文时,自动分段改写;更短的草稿走原来的单篇流程,一点不变。切分在 `web/js/document.js`:先把原样保留的文字换成占位符(和单篇同一套),占位符是原子,任何切点都不落在里面;切点优先级 空行 → 换行 → 句末(含中文句号和后面的引号)→ 分句标点 → 空白 → 按字硬切(不切开代理对);相邻小块合并成大致等长的段,每段目标约 560 token(≈ `hz` 的 350 英文词 / 600 汉字),先按字数估算,再用 `/tokenize` 实数,超过 760 的按实测比例再切。段与段之间原文的空白(空行、缩进)原样保留,拼回去和原稿逐字一致。每段走和单篇完全相同的 `generate()`:同一提示词、同一采样,语言保险和 Create fact 核对/重试都按段做;只有完整(EOS 结束、没被截断)、非空、带齐本段保留文字的结果才算完成。改写区上方有进度条;改写中草稿框只读(停止后恢复)。每完成一段,断点(草稿、保留段、各段原文和已完成的结果、模型档位 + 提示词 + 采样的签名)存进 localStorage 的 `hz.document`;点「停止」、出错或刷新页面后,点「继续改写」或 ⌘↵ 从没完成的那段接着改,已完成的段不再送进引擎。草稿或保留段一改,断点作废;换了档位/设置,只能「重新开始」。存不进 localStorage(满了、无痕、被禁用)时照常改写,只提示进度只在这个页面里。全部完成后结果按原文空白拼好,和单篇一样进历史(多记一个段数),可以复制,也可以「下载」成 UTF-8 `.txt`(单篇结果同样能下载)。各段分开改写,段与段的衔接、数字和人名要人看一遍,完成提示里会说。
+- **外部模型服务**(0.3.4,HF 讨论 #11):「…」→「外部模型服务」(选档页下面也有入口)。打开后启动器不拉起自带 llama.cpp、暂停未完成的下载(半截文件留着),直接 `ready`,`engine.backend = "external"`;网页的改写请求改发 `/api/v1/chat/completions`,启动器反代到 `<地址>/chat/completions`(`internal/launcher/external.go`)。走反代而不是网页直连,是因为网页 CSP 只许连自己、外部服务多半没开 CORS,而且 API key 不该进浏览器:key 只发给启动器一次,存在数据目录的 `external-api-key`(0600),由反代加到 `Authorization` 头上;`settings.json` 的 `external` 只存开关、规范化后的地址(`localhost:1234` → `http://localhost:1234/v1`,`…/v1/chat/completions` 也认)和模型名。外部模式下 `/api/*` 只放行这一个接口,换档/重启引擎回 409,下载完成或模型更新也不会把自带引擎拉起来;开关状态重启后保留,关掉就按原来的开机流程起自带引擎。请求体:`messages` 只有一条 user(草稿,占位符照旧),没有 system,采样参数和自带引擎相同(temperature 1.0、top_p 0.95、top_k 0、min_p 0、repeat_penalty 1.0),`max_tokens` = n_predict,`stream: true`,模型名留空就不带 `model`。`web/js/api.js` 的 `streamChat` 把 `chat.completion.chunk` 流换成和 `/completion` 一样的事件(`finish_reason: "length"` → 截断),所以语言保险、Create fact 核对重试、长文分段完全复用。外部服务没有 `/tokenize`,token 数按字数估算(`document.js` 的 `approxTokens`,偏保守),上下文按配置的 8192 算。连不上(502 `external_unreachable`)、401/403、模型名不对,网页各给一句说明。设置面板的「测试连接」由启动器 GET `<地址>/models`(6 秒超时),顺便把模型名填上(名字带 humanizer 的优先)。
 - **原样保留 / Create fact**(0.3.2,外部贡献 PR #3):在草稿里选中一段文字,选区旁弹出「原样保留」按钮,点了这段就进草稿下方的保留条(可逐条移除,最多 50 段,跟草稿一起存在浏览器 localStorage,也记进历史;草稿里找不到原文的会自动去掉)。改写时 `web/js/facts.js` 把每段原文换成占位符 `[[HZ_LOCK_0]]`、`[[HZ_LOCK_1]]`…(重叠的选区合并,同一段出现几次换几次;前缀保证不在草稿里出现,撞了就在前面加 `_`),模型只看到占位符,提示词和采样参数不变。流式途中已写完的占位符当场换回原文显示,写到一半的先不显示;写完核对每个占位符恰好出现一次(模型偶尔写成 `[HZ_LOCK_0]` 或不带括号,编号还在也认),再换回原文。丢了、重复了、被截断就整篇重写,最多 3 次(`FACT_TRIES`),都不行就作废,绝不交出缺了原文的版本。选这个做法的依据(10 月真模型实测,12B Q8_0,App 同款提示词和采样;32 篇中英文草稿 × 2 次,共 130 处保留段,有名字、日期、从句和整句):占位符方案 64 次改写首次全部原样带回,只有 3 处模型改了括号写法(少一层或换成圆括号),按上面的宽松规则都认得出;不用占位符、事后核对的话,模型会改掉大部分保留段(整句和从句几乎全被改写,多是换个说法、调个语序),重试 4 次也只有少数篇过关;给保留段加引号同样没用;换成 `ZQ-7301` 这种编号样的占位符,模型会把它当成真实编号复制或挪位置,首次就有 7 次没过。占位符方案的改写深度和长度与不保护时相比只差一点(照抄略多、略短一点)。保留段越多、越短,改写的自由越小;保留的只是这段文字本身,周围的说法仍要人看。提示词 token 数按带占位符的文本算。
 - **草稿一直能改 + 保留标记**(0.3.3):改写后草稿框不再切成只读对比视图。草稿框下面垫一层同排版的标记层(`#draft-marks`,`diff.js` 的 `markBits`/`factBits`/`renderRuns` 按字符标记位分段画),画保留文字的浅蓝底和「被改掉的」删除线,文字本身仍由草稿框画,宽高和滚动跟草稿框同步;草稿一改、和上次改写用的不一样了,删除线就消失。改写结果里保留的文字同样标蓝,底栏显示「原样保留 N」。保留条在草稿有字时常驻,还没保留任何文字时显示一行用法提示;点标签会在草稿里选中那段并滚过去。
 - **选档**(0.3.0 起五档):内存 ≥32G → Q8_0;≥16G → Q6_K;≥14G → Q4_K_M;≥12G → Q3;更少 → 2-bit(内存不到 8 GB 时选档页会提示可能装不下)。有 1 GB 容差(32 GB 的 Windows 机器常报 31.x GB,16 GB 带集显的常报 13–15 GB)。门槛 = 改写时 llama-server 峰值内存(M5 Max 实测:Q8_0 约 14 GB、Q4_K_M 10.0、Q3 8.0、2-bit 6.2;Q6_K 估 11)再给系统和浏览器留约 4 GB;8 GB 机器只剩 2-bit 装得下。以前选过 lite 档(已下线)的机器,选档页会提示并预选推荐档,旧文件不删。
@@ -69,6 +70,7 @@ app/
 │   ├── engine.go              拉起 llama-server、后端回退、日志解析、崩溃重启
 │   ├── server.go              HTTP:静态网页、/app/* 接口、/api/* 反代、安全检查
 │   ├── document.go            导入 .docx / .pdf:上传接口、DOCX 正文/表格提取
+│   ├── external.go            外部 OpenAI 兼容服务:设置、测试连接、/api/v1/chat/completions 反代
 │   ├── document_pdf.go        PDF:ToUnicode 解码、按坐标拼行分段、部首码位归一、乱码拦截(testdata/ 里是 Chrome 打印的真实 PDF)
 │   ├── update*.go semver.go   检查更新:GitHub Releases / HF 比对、下载、原地替换、重启计划与回滚(见下文「检查更新」)
 │   ├── prompt.go              提示词(唯一事实源)
@@ -82,17 +84,18 @@ app/
 │   ├── js/diff.js             词级差异(英文按词、中文按字)+ 语义清理 + 标点静音
 │   ├── js/prompt.js text.js   拼提示词、Python 式 strip、字数、数字核对
 │   ├── js/document.js         长文分段改写:切分、断点、续跑
+│   ├── js/external.js         外部模型服务设置面板
 │   ├── js/api.js history.js i18n.js samples.js boot.js
 │   ├── fonts/                 Instrument Sans / Bricolage Grotesque / JetBrains Mono(OFL,拉丁子集)
 │   └── img/mark.svg
 ├── devtools/
-│   ├── fakellama/             假 llama-server(校验提示词格式、SSE 流式、可模拟崩溃/0 层上 GPU、校验 API key)
+│   ├── fakellama/             假 llama-server(校验提示词格式、SSE 流式、可模拟崩溃/0 层上 GPU、校验 API key;也有 OpenAI 兼容的 /v1/chat/completions,测外部服务)
 │   ├── fakehf/                假 Hugging Face(302 + X-Linked-Size/Etag、Range、限速、模拟断线;-changed 模拟模型更新)
 │   ├── fakegh/                假 GitHub Releases(发布列表 + 302 下载,目录里放安装包就等于发了新版)
 │   ├── shot/                  无头 Chrome 截图(DevTools 协议,标准库手写 WebSocket)
 │   ├── fixtures/samples.json  两条真实草稿 + 模型真实输出
 │   ├── dev.sh                 本地开发(假引擎 + 网页读磁盘)
-│   ├── e2e.sh                 启动器端到端测试(37 项)
+│   ├── e2e.sh                 启动器端到端测试(50 项)
 │   ├── shots.sh               用假引擎重出界面截图到 docs/screenshots/(只供开发对照,不进 README)
 │   ├── update_e2e.sh          检查更新端到端(macOS:假 .app + 真 dmg,替换、重启、回滚、模型更新,35 项)
 │   ├── update_shots.sh        检查更新界面截图(中英文、深浅色、手机宽度)
@@ -128,7 +131,7 @@ bash devtools/dev.sh fresh      # 从首次运行(选档 → 下载)开始;下�
 ```bash
 go test ./...                   # Go 单测
 node devtools/webtest.mjs       # 网页逻辑(提示词指纹、strip、n_predict、差异、数字核对)
-bash devtools/e2e.sh            # 端到端:下载断线续传/暂停/退出后续传/校验、反代与流式、单实例、退出收尾、后端回退、残留清理
+bash devtools/e2e.sh            # 端到端:下载断线续传/暂停/退出后续传/校验、反代与流式、单实例、退出收尾、后端回退、残留清理、外部服务
 bash devtools/shots.sh          # 用假引擎重截 docs/screenshots/(开发对照用;README 用的是 docs/screenshots-real/)
 node devtools/webtest_update.mjs   # 更新面板逻辑
 bash devtools/update_e2e.sh        # 检查更新端到端(只在 macOS 上跑:要 hdiutil / codesign)
