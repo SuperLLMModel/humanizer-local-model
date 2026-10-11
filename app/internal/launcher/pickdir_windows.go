@@ -19,11 +19,15 @@ import (
 // 起始目录和标题走环境变量传,不拼进脚本,免得路径里的引号出问题。
 // 用户取消时返回空字符串,不报错。
 func pickDir(ctx context.Context, from, title string) (string, error) {
+	return runPickScript(ctx, pickPrelude+pickScript, from, title)
+}
+
+func runPickScript(ctx context.Context, script, from, title string) (string, error) {
 	if from == "" {
 		from = "."
 	}
-	cmd := exec.CommandContext(ctx, "powershell.exe", "-NoProfile", "-Sta", "-ExecutionPolicy", "Bypass",
-		"-Command", pickScript)
+	cmd := exec.CommandContext(ctx, "powershell.exe", "-NoProfile", "-NonInteractive", "-Sta", "-ExecutionPolicy", "Bypass",
+		"-Command", script)
 	cmd.Env = append(os.Environ(), "HZ_PICK_START="+from, "HZ_PICK_TITLE="+title)
 	prepareCmd(cmd) // 不弹控制台窗口;对话框自己的窗口照常显示
 	var out, errb bytes.Buffer
@@ -42,6 +46,12 @@ func pickDir(ctx context.Context, from, title string) (string, error) {
 	}
 	return absDir(strings.TrimSpace(out.String())), nil
 }
+
+// pickPrelude:输出一律 UTF-8。不设的话 PowerShell 按控制台代码页(英文系统 437、中文系统 936)写,
+// 中文路径到 Go 这边成了问号或乱码。
+const pickPrelude = `
+[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false
+`
 
 // 成功把选中的路径打到 stdout(取消则不打);哪一步失败,那一步的原因写 stderr,退出码非 0。
 const pickScript = `
