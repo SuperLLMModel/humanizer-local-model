@@ -121,6 +121,19 @@ func main() {
 	mux.HandleFunc("POST /tokenize", func(w http.ResponseWriter, r *http.Request) {
 		var req struct{ Content string }
 		json.NewDecoder(r.Body).Decode(&req)
+		// 草稿里带 slow-tokenize 时模拟引擎卡在数 token 上(默认 20 秒,FAKE_TOKENIZE_MS 可改),测网页的超时和「停止」
+		if strings.Contains(req.Content, "slow-tokenize") {
+			ms := 20000
+			if v, err := strconv.Atoi(os.Getenv("FAKE_TOKENIZE_MS")); err == nil && v > 0 {
+				ms = v
+			}
+			select {
+			case <-time.After(time.Duration(ms) * time.Millisecond):
+			case <-r.Context().Done():
+				logf("fake: tokenize canceled by client")
+				return
+			}
+		}
 		n := approxTokens(req.Content)
 		toks := make([]int, n)
 		for i := range toks {

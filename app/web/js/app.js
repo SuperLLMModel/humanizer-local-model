@@ -69,6 +69,9 @@ async function loadConfig() {
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// 换档/重启引擎要先停掉旧的 llama-server(启动器最多等 5+3 秒),慢机器上会超过 postJSON 默认的 10 秒。
+// 超时只是网页不再等,启动器照常做完,轮询会显示结果;这里放宽,免得白白弹一个超时提示。
+const SLOW_POST_MS = 30000;
 
 // ───────────────────────── 轮询状态 ─────────────────────────
 async function poll() {
@@ -803,7 +806,7 @@ function effectiveTheme() {
 
 async function setup(tier, endpoint) {
   try {
-    await postJSON('/app/setup', { tier, endpoint });
+    await postJSON('/app/setup', { tier, endpoint }, { timeout: SLOW_POST_MS });
     S.forceSetup = false;
     S.tierSig = '';
   } catch (e) {
@@ -1045,7 +1048,7 @@ function bind() {
   $('btn-err-choose').addEventListener('click', () => { S.forceSetup = true; S.tierSig = ''; render(); });
   $('btn-retry').addEventListener('click', async () => {
     const st = S.status;
-    if (st.error?.kind === 'engine') { await postJSON('/app/engine/restart').catch((e) => toast(e.message)); poll(); }
+    if (st.error?.kind === 'engine') { await postJSON('/app/engine/restart', {}, { timeout: SLOW_POST_MS }).catch((e) => toast(e.message)); poll(); }
     else await setup(st.download?.tier || st.tier, st.endpoint);
   });
   $('btn-err-logs').addEventListener('click', () => postJSON('/app/reveal', { what: 'logs' }).then(() => toast(t('toast.revealed'))).catch((e) => toast(e.message)));
@@ -1081,7 +1084,7 @@ function bind() {
   }
   $('pa-tier').addEventListener('click', () => { togglePop(false); S.forceSetup = true; S.pickTier = S.status?.tier; S.tierSig = ''; render(); });
   $('pa-reveal').addEventListener('click', () => postJSON('/app/reveal', { what: 'models' }).then(() => toast(t('toast.revealed'))).catch((e) => toast(e.message)));
-  $('pa-restart').addEventListener('click', async () => { togglePop(false); toast(t('toast.restarting')); await postJSON('/app/engine/restart').catch((e) => toast(e.message)); poll(); });
+  $('pa-restart').addEventListener('click', async () => { togglePop(false); toast(t('toast.restarting')); await postJSON('/app/engine/restart', {}, { timeout: SLOW_POST_MS }).catch((e) => toast(e.message)); poll(); });
   $('pa-quit').addEventListener('click', async () => {
     if (!confirm(t('confirm.quit'))) return;
     S.quit = true;
