@@ -90,17 +90,16 @@ func TestResolveStartPathsLocked(t *testing.T) {
 	}
 }
 
-func TestLocationJSONIsASCII(t *testing.T) {
+func TestLocationJSONPlainUTF8(t *testing.T) {
 	for _, p := range []string{
 		`D:\模型 文件夹\R&D <新>`,
 		"/Volumes/外置 盘/Humanizer \"引号\" 😀",
 		`\\nas\共享\models`,
 	} {
 		b := locationJSON(location{DataDir: p, ModelDir: p + "2"})
-		for _, c := range b {
-			if c > 0x7e || (c < 0x20 && c != '\n') {
-				t.Fatalf("location.json 里有非 ASCII 字节 %#x:%s", c, b)
-			}
+		// 卸载程序只认 \\ 和 \" 两种转义:中文、&、<、> 都得原样写
+		if strings.Contains(string(b), `\u`) {
+			t.Fatalf("不该有 \\u 转义:%s", b)
 		}
 		var got location
 		if err := json.Unmarshal(b, &got); err != nil {

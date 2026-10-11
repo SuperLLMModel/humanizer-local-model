@@ -168,8 +168,8 @@ check("设置写进了新运行目录", exists(RUN_DIR, "settings.json"))
 check("引擎日志写在新运行目录", exists(RUN_DIR, "logs", "llama-server.log"))
 check("启动器日志也换到了新运行目录", exists(RUN_DIR, "logs", "launcher.log"))
 raw = open(os.path.join(DEF, "location.json"), "rb").read()
-print("    location.json:", raw.decode("ascii", "replace").replace("\n", " "))
-check("location.json 是纯 ASCII(卸载程序读得懂)", all(b < 0x80 for b in raw))
+print("    location.json:", raw.decode("utf-8", "replace").replace("\n", " "))
+check("location.json 里中文原样写、没有 \\u 转义(卸载程序只认 \\\\ 和 \\\")", b"\\u" not in raw)
 loc = json.loads(raw)
 check("location.json 读回来就是那两个目录", same(loc["data_dir"], RUN_DIR) and same(loc["model_dir"], MODEL_DIR))
 
@@ -276,7 +276,7 @@ for name, loc, victims in cases:
     shutil.rmtree(os.path.join(HOME, "Documents", "logs"), ignore_errors=True)
     shutil.rmtree("D:\\logs", ignore_errors=True)
 
-for name, content in [("不是 JSON", b"{not json"), ("UTF-8 原文(没转义的中文)", '{"model_dir": "D:\\\\hz-ci\\\\中文"}'.encode("utf-8")),
+for name, content in [("不是 JSON", b"{not json"), ("用了 \\u 转义(启动器不会这么写)", b'{"model_dir": "D:\\\\hz-ci\\\\\\u4e2d\\u6587"}'),
                       ("值里有控制字符", b'{"model_dir": "D:\\\\hz-ci\\\\a\\nb"}')]:
     reset_world()
     install()

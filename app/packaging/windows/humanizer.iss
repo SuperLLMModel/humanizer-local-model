@@ -75,13 +75,13 @@ zh.OnlyOurFiles=（只删 Humanizer 自己的文件，这个文件夹里别的�
 //     只按名字删 Humanizer 写过的文件,再删掉已经空了的文件夹;
 //   - location.json 读不懂、路径不是普通的绝对路径、指到盘符根/用户目录/系统目录,一律当没设过。
 
-// 从 location.json 的内容里取一个字符串字段。启动器写的是纯 ASCII(非 ASCII 一律 \uXXXX,
-// 见 paths.go 的 locationJSON),这里只认这种写法;看不懂就返回空串。
+// 从 location.json 的内容里取一个字符串字段。启动器写的是 UTF-8、只有 \\ 和 \" 两种转义
+// (见 paths.go 的 locationJSON),这里只认这种写法;别的转义、控制字符一律返回空串(当没设过)。
 function JsonString(const S, Key: String): String;
 var
-  I, N, Code: Integer;
+  I, N: Integer;
   C: Char;
-  V, Hex: String;
+  V: String;
 begin
   Result := '';
   I := Pos('"' + Key + '"', S);
@@ -101,7 +101,7 @@ begin
       Result := V;
       Exit;
     end;
-    if (Ord(C) < 32) or (Ord(C) > 126) then Exit;
+    if Ord(C) < 32 then Exit;
     if C <> '\' then
     begin
       V := V + C;
@@ -111,21 +111,9 @@ begin
     begin
       if I = N then Exit;
       C := S[I + 1];
-      if (C = '"') or (C = '\') or (C = '/') then
-      begin
-        V := V + C;
-        I := I + 2;
-      end
-      else if C = 'u' then
-      begin
-        Hex := Copy(S, I + 2, 4);
-        Code := StrToIntDef('$' + Hex, -1);
-        if (Length(Hex) <> 4) or (Code < 32) then Exit;
-        V := V + Chr(Code);
-        I := I + 6;
-      end
-      else
-        Exit;
+      if (C <> '"') and (C <> '\') then Exit;
+      V := V + C;
+      I := I + 2;
     end;
   end;
 end;
@@ -241,7 +229,9 @@ end;
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
   Def, DataDir, ModelDir, List: String;
-  Content: AnsiString;
+  Lines: TArrayOfString;
+  Content: String;
+  I: Integer;
   HasDef, HasData, HasModel: Boolean;
 begin
   if CurUninstallStep <> usPostUninstall then Exit;
@@ -250,10 +240,13 @@ begin
   // 先读 location.json:它就在默认目录里,删了就读不到了
   DataDir := '';
   ModelDir := '';
-  if LoadStringFromFile(Def + '\location.json', Content) then
+  if LoadStringsFromFile(Def + '\location.json', Lines) then // 按 UTF-8 读,中文路径不会乱
   begin
-    DataDir := RemoveBackslash(JsonString(String(Content), 'data_dir'));
-    ModelDir := RemoveBackslash(JsonString(String(Content), 'model_dir'));
+    Content := '';
+    for I := 0 to GetArrayLength(Lines) - 1 do
+      Content := Content + Lines[I] + #10;
+    DataDir := RemoveBackslash(JsonString(Content, 'data_dir'));
+    ModelDir := RemoveBackslash(JsonString(Content, 'model_dir'));
   end;
 
   Log(Format('location.json: data_dir=[%s] model_dir=[%s]', [DataDir, ModelDir]));

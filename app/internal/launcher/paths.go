@@ -1,6 +1,7 @@
 package launcher
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -8,7 +9,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"unicode/utf16"
 )
 
 // defaultDataDir:Mac ~/Library/Application Support/Humanizer,
@@ -34,7 +34,7 @@ func defaultDataDir() string {
 // pointerName:一个很小的文件,记着用户在网页上把存储位置改到了哪儿。
 // 平时放在默认数据目录里,所以运行目录整个换掉、甚至搬走了,下次启动照样找得到;
 // 运行目录被 --data-dir 钉死时放在那个目录里,只记模型目录。
-// Windows 卸载程序也读它(humanizer.iss),所以只用 ASCII 写(见 locationJSON)。
+// Windows 卸载程序也读它(humanizer.iss),写法见 locationJSON。
 const pointerName = "location.json"
 
 // location 只存路径,别的一概不放:这样数据目录丢了还能靠它找回来。
@@ -121,38 +121,15 @@ func saveLocation(pointerDir, dataDir, modelDir string) error {
 	return writeFileAtomic(p, locationJSON(loc))
 }
 
-// locationJSON 写成纯 ASCII 的 JSON:非 ASCII 字符(中文路径)一律写成 \uXXXX。
-// Inno Setup 的卸载脚本按字节读文件、只会解这几种转义,中文直接写 UTF-8 会被它按本地代码页读成乱码。
+// locationJSON:UTF-8,中文和 & < > 原样写(不用 \uXXXX)。
+// Windows 卸载程序(humanizer.iss)按 UTF-8 读这个文件,只认 \\ 和 \" 两种转义,别的转义一律当没设过。
 func locationJSON(loc location) []byte {
-	var kv [][2]string
-	if loc.DataDir != "" {
-		kv = append(kv, [2]string{"data_dir", loc.DataDir})
-	}
-	if loc.ModelDir != "" {
-		kv = append(kv, [2]string{"model_dir", loc.ModelDir})
-	}
-	var b strings.Builder
-	b.WriteString("{")
-	for i, f := range kv {
-		if i > 0 {
-			b.WriteString(",")
-		}
-		b.WriteString("\n  \"" + f[0] + "\": \"")
-		for _, u := range utf16.Encode([]rune(f[1])) {
-			switch {
-			case u == '"' || u == '\\':
-				b.WriteByte('\\')
-				b.WriteByte(byte(u))
-			case u < 0x20 || u > 0x7e:
-				fmt.Fprintf(&b, `\u%04x`, u)
-			default:
-				b.WriteByte(byte(u))
-			}
-		}
-		b.WriteString("\"")
-	}
-	b.WriteString("\n}\n")
-	return []byte(b.String())
+	var b bytes.Buffer
+	enc := json.NewEncoder(&b)
+	enc.SetEscapeHTML(false)
+	enc.SetIndent("", "  ")
+	_ = enc.Encode(loc)
+	return b.Bytes()
 }
 
 func absDir(p string) string {
