@@ -185,11 +185,13 @@ code, r = api("/app/paths", {"data_dir": RUN_DIR, "model_dir": MODEL_DIR})
 check("改回中文运行目录", code == 200 and wait_phase("ready"))
 
 # 很长的路径(超过 260 个字符)
-longdir = ROOT + "\\" + "\\".join(["很长的目录名" * 6] * 4)
-code, r = api("/app/paths", {"data_dir": RUN_DIR, "model_dir": longdir})
-check(f"超过 MAX_PATH 的模型目录也能设(长度 {len(longdir)},HTTP {code})", code == 200)
-code, r = api("/app/paths", {"data_dir": RUN_DIR, "model_dir": MODEL_DIR})
-check("改回来,引擎就绪", code == 200 and wait_phase("ready"))
+longdir = ROOT + "\\" + "\\".join(["很长的目录名" * 6] * 8)
+assert len(longdir) > 300
+code, r = api("/app/paths", {"data_dir": RUN_DIR, "model_dir": longdir, "move": True})
+check(f"超过 MAX_PATH 的模型目录(长度 {len(longdir)})能设、模型搬得进去(HTTP {code} {r.get('moved')})", code == 200 and r.get("moved") == 1)
+check("长路径下的模型能被(假)引擎加载", wait_phase("ready"))
+code, r = api("/app/paths", {"data_dir": RUN_DIR, "model_dir": MODEL_DIR, "move": True})
+check("搬回来,引擎就绪", code == 200 and r.get("moved") == 1 and wait_phase("ready"))
 
 # 不能写的位置:盘符不存在
 code, r = api("/app/paths", {"data_dir": "Q:\\nope", "model_dir": MODEL_DIR})
