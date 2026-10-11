@@ -15,6 +15,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -848,6 +849,9 @@ func TestApplySwapFailsBeforeTouchingOldVersion(t *testing.T) {
 }
 
 func TestApplyInstallerSuccessAndFailure(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("假安装包是 /bin/sh 脚本;Windows 上真安装包的覆盖安装由 app-test 的 windows 任务测")
+	}
 	for _, tc := range []struct {
 		name   string
 		script string

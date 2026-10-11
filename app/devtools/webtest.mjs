@@ -9,6 +9,7 @@ import { pyStrip, countText, numberCheck, estimateTokens, isLongDraft } from '..
 import { buildPrompt, nPredictFor, selfCheck } from '../web/js/prompt.js';
 import { tokenize, diffTokens } from '../web/js/diff.js';
 import { hanCount, wentChinese, wentEnglish, langDrift, withLangGuard, LANG_RETRIES } from '../web/js/guard.js';
+import { customPaths, modelDirDefault, pathsHintKey, sameDir } from '../web/js/paths.js';
 
 let fails = 0;
 const ok = (cond, msg) => { if (!cond) { fails++; console.error('✗', msg); } else console.log('✓', msg); };
@@ -171,7 +172,7 @@ for (const s of fx.samples) {
   ok(stopped, '用户停止直接抛出,不重试');
 }
 
-// Request deadlines cover both headers and JSON bodies; cancellation is distinct.
+// 11. Request deadlines cover both headers and JSON bodies; cancellation is distinct.
 {
   const originalFetch = globalThis.fetch;
   const stalled = (signal) => new Promise((resolve,reject) => {
@@ -219,7 +220,7 @@ for (const s of fx.samples) {
   } finally {globalThis.fetch=originalFetch;}
 }
 
-// Long-document planning and durable, section-level commits(PR #5,0.3.4 集成时重写了切分)
+// 12. Long-document planning and durable, section-level commits(PR #5,0.3.4 集成时重写了切分)
 {
   const dc = {...cfg, ctx_size:8192, sampling:{temperature:1,top_p:0.95}};
   // 假 tokenizer:汉字 1 个 1 token,其余 4 个字符 1 token(和 approxTokens 的估算故意不一样,逼出「实测再切」)
@@ -323,7 +324,7 @@ for (const s of fx.samples) {
   ok(pd0.facts.length===1 && pd0.text.includes('[[HZ_LOCK_0]]') && !pd0.text.includes(fact), '每段只保护本段里出现的保留文字');
 }
 
-// localStorage 不可用(无痕 / 被禁用 / 抛异常):存取都不崩,断点读出来是 null
+// 13. localStorage 不可用(无痕 / 被禁用 / 抛异常):存取都不崩,断点读出来是 null
 {
   const desc = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
   Object.defineProperty(globalThis, 'localStorage', { configurable: true, get() { throw new Error('SecurityError'); } });
@@ -340,7 +341,7 @@ for (const s of fx.samples) {
   }
 }
 
-// 外部 OpenAI 兼容服务:streamChat 把 chat.completion.chunk 换成 /completion 那样的事件
+// 14. 外部 OpenAI 兼容服务:streamChat 把 chat.completion.chunk 换成 /completion 那样的事件
 {
   const { streamChat } = await import('../web/js/api.js');
   const originalFetch = globalThis.fetch;
@@ -383,6 +384,45 @@ for (const s of fx.samples) {
   ok(pickModel(['a', 'humanizer-12b-q8_0', 'b']) === 'humanizer-12b-q8_0' && pickModel(['only']) === 'only' && pickModel(['a', 'b']) === '' && pickModel([]) === '', 'pickModel:优先名字带 humanizer 的,只有一个就用它,猜不出就留空');
   const d1 = describeTest({ ok: false, code: 'auth' }), d2 = describeTest({ ok: false, code: 'unreachable', url: 'http://localhost:1234/v1' }), d3 = describeTest({ ok: true, models: ['m'] });
   ok(d1.kind === 'err' && /API key/.test(d1.text) && /localhost:1234/.test(d2.text) && d3.kind === 'ok', 'describeTest:key 错 / 连不上 / 连上了 各有一句说明');
+}
+
+// 15. 存储位置:默认目录、尾斜杠、是否自定义过
+{
+  const win = { data_dir: 'C:\\Users\\B\\AppData\\Local\\Humanizer', default_data_dir: 'C:\\Users\\B\\AppData\\Local\\Humanizer', model_dir: 'C:\\Users\\B\\AppData\\Local\\Humanizer\\models' };
+  const mac = { data_dir: '/Users/b/Library/Application Support/Humanizer', default_data_dir: '/Users/b/Library/Application Support/Humanizer', model_dir: '/Users/b/Library/Application Support/Humanizer/models' };
+  ok(modelDirDefault(win) === 'C:\\Users\\B\\AppData\\Local\\Humanizer\\models', 'Windows 默认模型目录');
+  ok(modelDirDefault(mac) === '/Users/b/Library/Application Support/Humanizer/models', 'macOS 默认模型目录');
+  ok(!customPaths(win) && !customPaths(mac), '没改过时不算自定义');
+  ok(customPaths({ ...win, model_dir: 'D:\\models' }), '改了模型目录');
+  ok(customPaths({ ...win, data_dir: 'D:\\Humanizer' }), '改了运行目录');
+  // 运行目录被启动参数钉死时,那个"不一样"不算用户改的
+  ok(!customPaths({ ...win, data_dir_locked: true }), '钉死的运行目录不算自定义');
+  ok(modelDirDefault({ ...win, data_dir_locked: true }) === 'C:\\Users\\B\\AppData\\Local\\Humanizer\\models', '钉死时模型目录以它为基准');
+  // 尾斜杠、大小写不算改动
+  ok(!customPaths({ ...win, model_dir: 'c:\\users\\b\\appdata\\local\\humanizer\\models\\' }), '尾斜杠和大小写不算改动');
+  ok(!customPaths({ ...mac, model_dir: '/Users/b/Library/Application Support/Humanizer/models/' }), 'macOS 尾斜杠不算改动');
+  ok(sameDir('D:\\a', 'D:\\a\\') && sameDir('/x/y/', '/x/y') && !sameDir('D:\\a', 'D:\\b') && !sameDir('', 'D:\\a'),
+    '目录比较忽略尾斜杠、认得出不同目录');
+  // 摘要上那一句:三种状态
+  ok(pathsHintKey(win) === 'paths.hintDefault', '默认 → 默认在系统盘');
+  ok(pathsHintKey({ ...win, data_dir_locked: true }) === 'paths.hintLocked', '被启动参数钉死 → 由启动参数指定');
+  ok(pathsHintKey({ ...win, data_dir_locked: true, model_dir: 'D:\\models' }) === 'paths.hintCustom', '钉死但改了模型目录 → 仍算自定义');
+  ok(pathsHintKey({ ...win, model_dir: 'D:\\models' }) === 'paths.hintCustom', '改了模型目录 → 自定义');
+}
+
+// 16. 文案:中英两份键一一对应,页面上用到的键都有(0.3.4 合并时英文少过 menu.paths / menu.changePaths)
+{
+  const src = readFileSync(new URL('../web/js/i18n.js', import.meta.url), 'utf8');
+  const zhAt = src.indexOf('\n  zh: {'), enAt = src.indexOf('\n  en: {');
+  const keys = (part) => new Set([...part.matchAll(/^\s+'([\w.]+)':/gm)].map((m) => m[1]));
+  const zh = keys(src.slice(zhAt, enAt)), en = keys(src.slice(enAt));
+  const onlyZh = [...zh].filter((k) => !en.has(k)), onlyEn = [...en].filter((k) => !zh.has(k));
+  ok(zh.size > 100 && !onlyZh.length && !onlyEn.length, `中英文案键一致(${zh.size} 个)${onlyZh.length ? ' 缺英文:' + onlyZh.join(',') : ''}${onlyEn.length ? ' 缺中文:' + onlyEn.join(',') : ''}`);
+  const html = readFileSync(new URL('../web/index.html', import.meta.url), 'utf8');
+  const used = [...html.matchAll(/data-i18n="([\w.]+)"/g)].map((m) => m[1])
+    .concat([...html.matchAll(/data-i18n-attr="([^"]+)"/g)].flatMap((m) => m[1].split(';').map((x) => x.split(':')[1])));
+  const missing = [...new Set(used)].filter((k) => !zh.has(k) || !en.has(k));
+  ok(!missing.length, `index.html 用到的文案键都有中英两份${missing.length ? ':缺 ' + missing.join(',') : ''}`);
 }
 
 if (fails) { console.error(`\n${fails} 项失败`); process.exit(1); }

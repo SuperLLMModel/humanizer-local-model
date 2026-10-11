@@ -40,7 +40,12 @@ type externalStatus struct {
 
 const externalKeyFile = "external-api-key"
 
-func (a *App) externalKeyPath() string { return filepath.Join(a.dataDir, externalKeyFile) }
+// externalKeyPath:key 跟着运行目录走(换运行目录时 storage.go 的 moveExternalKey 把它搬过去)。
+func (a *App) externalKeyPath() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return filepath.Join(a.dataDir, externalKeyFile)
+}
 
 func (a *App) loadExternalKey() string {
 	b, err := os.ReadFile(a.externalKeyPath())
@@ -259,6 +264,13 @@ func (a *App) handleExternalSet(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]any{"error": "bad json", "code": "bad_json"})
 		return
 	}
+	// 正在换存储位置(停引擎、搬模型、按新位置重新开机)时不让开关外部服务:
+	// 否则这边一关,boot() 会拿着搬到一半的模型文件拉起自带引擎。
+	if !a.pathsMu.TryLock() {
+		writeJSON(w, 409, map[string]any{"error": "storage location is being changed", "code": "paths_busy"})
+		return
+	}
+	defer a.pathsMu.Unlock()
 	base := ""
 	if strings.TrimSpace(req.URL) != "" || req.Enabled {
 		u, err := normalizeExternalURL(req.URL)

@@ -44,7 +44,7 @@ func envOr(k, def string) string {
 // Main 是启动器入口,返回进程退出码。
 func Main(o Options) int {
 	fl := flag.NewFlagSet("humanizer", flag.ContinueOnError)
-	dataDir := fl.String("data-dir", envOr("HUMANIZER_DATA_DIR", defaultDataDir()), "数据目录(模型、日志、设置)")
+	dataDirFlag := fl.String("data-dir", os.Getenv("HUMANIZER_DATA_DIR"), "数据目录(设置、日志、更新包;模型目录在网页上改)。不给就用系统默认位置或网页上改过的位置")
 	var engines multiFlag
 	fl.Var(&engines, "engine", "指定 llama-server 路径,可写 name=path,可重复(开发/测试用)")
 	baseURL := fl.String("base-url", envOr("HUMANIZER_BASE_URL", os.Getenv("HF_ENDPOINT")), "自定义下载源(替代 huggingface.co)")
@@ -75,20 +75,21 @@ func Main(o Options) int {
 	if *applyPlanPath != "" {
 		return runApplyHelper(*applyPlanPath)
 	}
-	if abs, err := filepath.Abs(*dataDir); err == nil { // 引擎的工作目录不是这里,必须用绝对路径
-		*dataDir = abs
-	}
+	// 存储位置:命令行 / 环境变量(钉死,网页上不让改运行目录) > 默认目录里的 location.json > 默认目录。
+	// 路径一律是绝对路径:引擎的工作目录不是这里。
+	sp := resolveStartPaths(*dataDirFlag)
+	dataDir := sp.DataDir
 	if e := os.Getenv("HUMANIZER_ENGINE"); e != "" && len(engines) == 0 {
 		engines = append(engines, e)
 	}
 
-	if err := os.MkdirAll(filepath.Join(*dataDir, "logs"), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Join(dataDir, "logs"), 0o755); err != nil {
 		fmt.Fprintln(os.Stderr, "无法创建数据目录:", err)
 		return 1
 	}
 
 	// 已经有一个在跑:直接打开它的页面
-	if inst, ok := runningInstance(*dataDir); ok {
+	if inst, ok := runningInstance(dataDir); ok {
 		u := fmt.Sprintf("http://127.0.0.1:%d/", inst.Port)
 		fmt.Println("Humanizer 已在运行:", u)
 		if !*noBrowser {
@@ -104,18 +105,21 @@ func Main(o Options) int {
 		return spawnDetached(args)
 	}
 
-	logPath := filepath.Join(*dataDir, "logs", "launcher.log")
+	logPath := filepath.Join(dataDir, "logs", "launcher.log")
 	rotateLog(logPath, 2<<20)
 	lf, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	var logw io.Writer = os.Stderr
 	if err == nil {
-		defer lf.Close()
 		logw = io.MultiWriter(lf, os.Stderr)
 	}
 	logger := log.New(logw, "", log.LstdFlags)
-	logger.Printf("===== Humanizer %s 启动 (%s/%s) 数据目录 %s", o.Version, runtime.GOOS, runtime.GOARCH, *dataDir)
+	logger.Printf("===== Humanizer %s 启动 (%s/%s) 数据目录 %s", o.Version, runtime.GOOS, runtime.GOARCH, dataDir)
+	if sp.Note != "" {
+		logger.Printf("%s", sp.Note)
+	}
+	logger.Printf("模型目录 %s(网页上的「存储位置」里可以改)", modelDirLog(sp.DataDir, sp.ModelDir))
 
-	cfg, err := loadConfig(o.DefaultConfig, filepath.Join(*dataDir, "config.json"))
+	cfg, err := loadConfig(o.DefaultConfig, filepath.Join(dataDir, "config.json"))
 	if err != nil {
 		logger.Printf("配置错误:%v", err)
 		return 1
@@ -127,7 +131,13 @@ func Main(o Options) int {
 		cfg.Update.GitHubAPI = *updateAPI
 	}
 
-	a := &App{opts: o, cfg: cfg, dataDir: *dataDir, logger: logger, apiKey: randomKey()}
+	a := &App{opts: o, cfg: cfg, dataDir: dataDir, logger: logger, logFile: lf, apiKey: randomKey(),
+		locModelDir: sp.ModelDir, pointerDir: sp.PointerDir, dataDirLocked: sp.DataDirLock}
+	defer func() {
+		if a.logFile != nil {
+			_ = a.logFile.Close()
+		}
+	}()
 	a.settings = loadSettings(a.settingsPath())
 	a.extKey = a.loadExternalKey()
 	if _, ok := cfg.endpoint(a.settings.Endpoint); !ok {
@@ -152,7 +162,7 @@ func Main(o Options) int {
 	}
 
 	// 上次被强杀留下的引擎
-	if b, err := os.ReadFile(filepath.Join(*dataDir, "instance.json")); err == nil {
+	if b, err := os.ReadFile(filepath.Join(dataDir, "instance.json")); err == nil {
 		var old instanceInfo
 		if json.Unmarshal(b, &old) == nil && killStaleEngine(old.EnginePID) {
 			logger.Printf("清理了上次残留的引擎进程 %d", old.EnginePID)

@@ -49,6 +49,15 @@
 - **外部模型服务**(0.3.4,HF 讨论 #11):「…」→「外部模型服务」(选档页下面也有入口)。打开后启动器不拉起自带 llama.cpp、暂停未完成的下载(半截文件留着),直接 `ready`,`engine.backend = "external"`;网页的改写请求改发 `/api/v1/chat/completions`,启动器反代到 `<地址>/chat/completions`(`internal/launcher/external.go`)。走反代而不是网页直连,是因为网页 CSP 只许连自己、外部服务多半没开 CORS,而且 API key 不该进浏览器:key 只发给启动器一次,存在数据目录的 `external-api-key`(0600),由反代加到 `Authorization` 头上;`settings.json` 的 `external` 只存开关、规范化后的地址(`localhost:1234` → `http://localhost:1234/v1`,`…/v1/chat/completions` 也认)和模型名。外部模式下 `/api/*` 只放行这一个接口,换档/重启引擎回 409,下载完成或模型更新也不会把自带引擎拉起来;开关状态重启后保留,关掉就按原来的开机流程起自带引擎。请求体:`messages` 只有一条 user(草稿,占位符照旧),没有 system,采样参数和自带引擎相同(temperature 1.0、top_p 0.95、top_k 0、min_p 0、repeat_penalty 1.0),`max_tokens` = n_predict,`stream: true`,模型名留空就不带 `model`。`web/js/api.js` 的 `streamChat` 把 `chat.completion.chunk` 流换成和 `/completion` 一样的事件(`finish_reason: "length"` → 截断),所以语言保险、Create fact 核对重试、长文分段完全复用。外部服务没有 `/tokenize`,token 数按字数估算(`document.js` 的 `approxTokens`,偏保守),上下文按配置的 8192 算。连不上(502 `external_unreachable`)、401/403、模型名不对,网页各给一句说明。设置面板的「测试连接」由启动器 GET `<地址>/models`(6 秒超时),顺便把模型名填上(名字带 humanizer 的优先)。
 - **原样保留 / Create fact**(0.3.2,外部贡献 PR #3):在草稿里选中一段文字,选区旁弹出「原样保留」按钮,点了这段就进草稿下方的保留条(可逐条移除,最多 50 段,跟草稿一起存在浏览器 localStorage,也记进历史;草稿里找不到原文的会自动去掉)。改写时 `web/js/facts.js` 把每段原文换成占位符 `[[HZ_LOCK_0]]`、`[[HZ_LOCK_1]]`…(重叠的选区合并,同一段出现几次换几次;前缀保证不在草稿里出现,撞了就在前面加 `_`),模型只看到占位符,提示词和采样参数不变。流式途中已写完的占位符当场换回原文显示,写到一半的先不显示;写完核对每个占位符恰好出现一次(模型偶尔写成 `[HZ_LOCK_0]` 或不带括号,编号还在也认),再换回原文。丢了、重复了、被截断就整篇重写,最多 3 次(`FACT_TRIES`),都不行就作废,绝不交出缺了原文的版本。选这个做法的依据(10 月真模型实测,12B Q8_0,App 同款提示词和采样;32 篇中英文草稿 × 2 次,共 130 处保留段,有名字、日期、从句和整句):占位符方案 64 次改写首次全部原样带回,只有 3 处模型改了括号写法(少一层或换成圆括号),按上面的宽松规则都认得出;不用占位符、事后核对的话,模型会改掉大部分保留段(整句和从句几乎全被改写,多是换个说法、调个语序),重试 4 次也只有少数篇过关;给保留段加引号同样没用;换成 `ZQ-7301` 这种编号样的占位符,模型会把它当成真实编号复制或挪位置,首次就有 7 次没过。占位符方案的改写深度和长度与不保护时相比只差一点(照抄略多、略短一点)。保留段越多、越短,改写的自由越小;保留的只是这段文字本身,周围的说法仍要人看。提示词 token 数按带占位符的文本算。
 - **草稿一直能改 + 保留标记**(0.3.3):改写后草稿框不再切成只读对比视图。草稿框下面垫一层同排版的标记层(`#draft-marks`,`diff.js` 的 `markBits`/`factBits`/`renderRuns` 按字符标记位分段画),画保留文字的浅蓝底和「被改掉的」删除线,文字本身仍由草稿框画,宽高和滚动跟草稿框同步;草稿一改、和上次改写用的不一样了,删除线就消失。改写结果里保留的文字同样标蓝,底栏显示「原样保留 N」。保留条在草稿有字时常驻,还没保留任何文字时显示一行用法提示;点标签会在草稿里选中那段并滚过去。
+- **存储位置**(外部贡献 PR #9):下载模型那一页有个「存储位置」折叠块(之后也能从「…」→「更改存储位置」进来),运行目录(设置、日志、引擎更新包)和模型目录(GGUF 与半截文件)都能改,不用再只能落在系统盘。两条路径各有一个输入框(可以直接粘贴路径)和「更改…」(弹系统文件夹选择器:Windows 用资源管理器同款选择器(IFileOpenDialog,经 PowerShell 调用,起始目录和标题走环境变量、不拼进脚本,输出强制 UTF-8;失败退 WinForms / Shell.Application),macOS 用 `choose folder`,Linux 依次试 zenity / kdialog;都不行就提示直接粘路径)。默认都在 `%LOCALAPPDATA%\Humanizer`(Mac `~/Library/Application Support/Humanizer`),摘要上会写「默认在系统盘」「已自定义」还是「由启动参数指定」。
+  - **运行目录不和用户的文件混放**:运行目录里有 `settings.json`、`config.json` 这类通用名字的文件(启动时还会把 `config.json` 当配置读),所以选的文件夹空着、或者本来就是 Humanizer 用过的运行目录(有 `logs/launcher.log`)才直接用;否则在里面建 `Humanizer` 子文件夹(子文件夹也被占了就报错)。模型目录没有这个限制,可以是放着别的模型的文件夹:启动器只认、只搬、卸载时只删配置里档位的文件名(`humanizer-*.gguf` 和它的 `.part` 等)。
+  - **改位置不会自动搬文件** —— 几十 GB 的移动是用户自己的决定,网页上要勾「把已下载的模型一起搬过去」才搬(`.part` 半截文件也一起搬,续传不用从头下)。同盘是改名;跨盘先复制成 `.moving`,全部复制完才改名、删旧文件,复制前先查空间;任何一个搬不过去就把已经挪过去的挪回来,位置不改、报错。新位置已经有同名文件就不覆盖。有 App 或模型更新正在下载/安装时不让改。
+  - 改完立刻生效:等手上的改写写完、停下载(等下载协程关掉半截文件)、停引擎(Windows 上引擎开着模型文件就搬不动),搬文件,换目录,写 `settings.json`,启动器日志也换到新运行目录里写,再按新位置重新判断开机状态(找到模型就重新起引擎,没找到就回到"选档")。旧运行目录里的东西不删。
+  - 记在**默认数据目录**下的 `location.json`(`{"data_dir":…,"model_dir":…}`,只写和默认不同的项;UTF-8,中文和 `& < >` 原样写,因为卸载程序要读、只认 `\\` 和 `\"` 两种转义),所以运行目录整个换掉、甚至搬走了,下次启动照样找得回来;两个都回默认就把这个文件删掉。记下的运行目录建不出来/写不进(盘没插)时这次先用默认位置并写进日志,下次插上又会用回去;模型目录则原样记着(悄悄改回默认等于把几十 GB 的模型挪了地方)。只认绝对路径。
+  - 命令行 `--data-dir` / `HUMANIZER_DATA_DIR` 给了就把**运行目录**钉死,网页上那一栏变只读;这时完全不看默认目录里的 `location.json`(开发、测试、便携用法不受本机装的 App 影响),**模型目录**照样能改,记在钉死的那个目录里的 `location.json`。
+  - **卸载**(Windows 安装包):先读 `location.json`,问一次要不要删数据。默认目录整个删(不会钻进里面的符号链接/目录联接);用户自己选的运行目录、模型目录只按名字删 Humanizer 写过的文件(运行目录还要有 `logs\launcher.log` 才认),删完空了才删文件夹。`location.json` 读不懂、不是普通绝对路径(盘符根、共享根、带 `..` 或 `/`、相对路径)、指到用户目录/文档/桌面/系统目录的,一律当没设过。静默卸载默认不删数据,设环境变量 `HUMANIZER_UNINSTALL_DELETE_DATA=1` 才删。CI 的 `app-test` 在 Windows 虚拟机上装、改位置、卸载,把这些情况都核对一遍(`devtools/win_storage_test.py`)。
+  - **和外部模型服务一起用**(0.3.4 合并时定的):外部服务开着也能改位置(比如把已下载的模型挪出系统盘)。这时不等进行中的改写(它走外部服务,不碰本机文件)、状态不切到「启动中」,改完按新位置重新判断开机状态时仍走外部模式,**不会拉起自带引擎**;从「…」→「更改存储位置」进来的那一页只剩存储位置一块(选档、下载按钮藏起来,标题换成「换个存储位置」,并说明自带引擎不会启动)。外部服务的设置在 `settings.json` 里,本来就整份写到新运行目录;API key 文件 `external-api-key` 也**跟着运行目录走**:按内存里那份写到新目录(0600),旧目录那份删掉,不在两处各留一份密钥;没有 key 时把新目录里以前留下的旧 key 也删掉,和刚写过去的 `settings.json` 一致。`--data-dir` 钉死运行目录时 key 自然留在原处。正在换位置时开关外部服务回 409(`paths_busy`),免得在搬模型的半路被 `boot()` 拉起自带引擎。卸载程序的运行目录白名单里有 `external-api-key`(和 `.tmp`)。外部模式的改写请求(`/api/v1/chat/completions`)也计入「正在改写」,App 更新会等它写完。
+  - 接口:`POST /app/paths`(`{"data_dir","model_dir","move","reset"}`)、`POST /app/pick-dir`(`{"what":"data"|"models"}`,取消返回空路径)。`/app/status` 多了 `model_dir`、`default_data_dir`、`data_dir_locked`。
 - **选档**(0.3.0 起五档):内存 ≥32G → Q8_0;≥16G → Q6_K;≥14G → Q4_K_M;≥12G → Q3;更少 → 2-bit(内存不到 8 GB 时选档页会提示可能装不下)。有 1 GB 容差(32 GB 的 Windows 机器常报 31.x GB,16 GB 带集显的常报 13–15 GB)。门槛 = 改写时 llama-server 峰值内存(M5 Max 实测:Q8_0 约 14 GB、Q4_K_M 10.0、Q3 8.0、2-bit 6.2;Q6_K 估 11)再给系统和浏览器留约 4 GB;8 GB 机器只剩 2-bit 装得下。以前选过 lite 档(已下线)的机器,选档页会提示并预选推荐档,旧文件不删。
 - **Q3 / 2-bit**:这两个文件把词表从 262,144 裁到约 130,000(BOS/EOS 编号不变,任何文本照样能编码),内嵌同一份聊天模板;App 走 `/completion` 拼原始提示词、显式传采样参数,所以和其他档完全一样。随包的 llama-server(b11335)实测两档都能加载,靠 EOS 停。
 - **引擎回退**:Windows 有 NVIDIA 驱动(`nvcuda.dll`)先试 CUDA,有 `vulkan-1.dll` 再试 Vulkan,最后 CPU;每个 GPU 后端先 `-ngl all`,起不来再 `-ngl auto`(让 llama.cpp 按显存自动分层)。GPU 后端起来了但日志显示 `offloaded 0/N layers` 也算失败,换下一个。macOS:Metal(all → auto)→ 同一个二进制 `--device none` 跑 CPU。
@@ -66,6 +75,9 @@ app/
 ├── internal/launcher/
 │   ├── main.go                命令行参数、单实例、macOS 后台化、端口、信号
 │   ├── app.go                 状态机(setup/downloading/paused/starting/ready/error)
+│   ├── storage.go             存储位置:运行目录 / 模型目录,改、搬文件、location.json、/app/paths、/app/pick-dir
+│   ├── pickdir_windows.go pickdir_unix.go   系统的「选文件夹」窗口(PowerShell IFileOpenDialog / osascript / zenity)
+│   ├── paths.go               数据目录解析(location.json)、路径收拾、引擎发现
 │   ├── download.go            断点续传下载 + sha256 + GGUF 魔数检查
 │   ├── engine.go              拉起 llama-server、后端回退、日志解析、崩溃重启
 │   ├── server.go              HTTP:静态网页、/app/* 接口、/api/* 反代、安全检查
@@ -74,13 +86,14 @@ app/
 │   ├── document_pdf.go        PDF:ToUnicode 解码、按坐标拼行分段、部首码位归一、乱码拦截(testdata/ 里是 Chrome 打印的真实 PDF)
 │   ├── update*.go semver.go   检查更新:GitHub Releases / HF 比对、下载、原地替换、重启计划与回滚(见下文「检查更新」)
 │   ├── prompt.go              提示词(唯一事实源)
-│   ├── config.go paths.go     配置合并、选档、数据目录、引擎发现
+│   ├── config.go              配置合并、选档、设置读写
 │   ├── sysinfo_*.go           内存 / GPU 探测(darwin / windows / 其他)
 │   ├── proc_unix.go proc_windows.go   进程组 / Job 对象、磁盘空间、打开浏览器
-│   └── *_test.go              提示词指纹、选档、配置覆盖、下载(断线续传/不支持 Range/校验失败/非 GGUF/404/暂停)、文档导入
+│   └── *_test.go              提示词指纹、选档、配置覆盖、下载(断线续传/不支持 Range/校验失败/非 GGUF/404/暂停)、文档导入、存储位置
 ├── web/                       纯静态网页(离线可用)
 │   ├── index.html  css/app.css
-│   ├── js/app.js              主控:轮询状态、视图、改写流式、历史、菜单
+│   ├── js/app.js              主控:轮询状态、视图、改写流式、历史、菜单、存储位置
+│   ├── js/paths.js            存储位置的纯逻辑(默认目录算哪、算不算自定义、摘要那句话说哪句)
 │   ├── js/diff.js             词级差异(英文按词、中文按字)+ 语义清理 + 标点静音
 │   ├── js/prompt.js text.js   拼提示词、Python 式 strip、字数、数字核对
 │   ├── js/document.js         长文分段改写:切分、断点、续跑
@@ -105,7 +118,7 @@ app/
 │   ├── llama-cpp.lock.json    llama.cpp 钉死版本(b11335)+ 每个压缩包的 sha256
 │   ├── fetch_engine.py        下载 + 校验 + 整理成 engine/{metal|cuda|vulkan|cpu}/
 │   ├── macos/                 Info.plist、build_app.sh(.app + .dmg + 签名/公证)、打不开怎么办.txt
-│   ├── windows/               humanizer.iss(Inno Setup)、build_win.sh(安装包 + 便携 zip)
+│   ├── windows/               humanizer.iss(Inno Setup)、build_win.sh(安装包 + 便携 zip)、README.md(出 Windows 包的完整步骤)
 │   └── icon/                  图标源文件 svg、1024 png、Windows ico
 ├── .github-workflows/release-app.yml   CI(发布时挪到仓库根的 .github/workflows/)
 ├── docs/screenshots-real/       真机实拍截图(README 用这批)
@@ -154,7 +167,7 @@ cp humanizer-12b-Q8_0.gguf ~/Library/Application\ Support/Humanizer/models/   # 
 
 | 参数 | 作用 |
 |---|---|
-| `--data-dir` | 数据目录(默认 Mac `~/Library/Application Support/Humanizer`,Windows `%LOCALAPPDATA%\Humanizer`) |
+| `--data-dir` | 数据目录(设置、日志、引擎更新包)。默认 Mac `~/Library/Application Support/Humanizer`,Windows `%LOCALAPPDATA%\Humanizer`;网页上的「存储位置」改过的话用它记下的那个。给了这个参数(或环境变量)就锁死,网页上那一栏改不了 |
 | `--engine name=path` | 指定 llama-server,可重复;不给就找随包附带的 |
 | `--base-url` | 换下载源(也认 `HF_ENDPOINT`),比如私有镜像 |
 | `--port` | 网页端口(默认用配置里的固定端口 47615,被占就顺延) |
@@ -186,7 +199,13 @@ python3 packaging/fetch_engine.py --target macos --out dist/engine
 bash packaging/macos/build_app.sh 0.3.2      # → dist/mac/Humanizer.app、dist/Humanizer-0.3.2-macos-arm64.dmg(约 15 MB)
 ```
 
-Windows 包只能在 Windows 上出(Inno Setup):`python packaging/fetch_engine.py --target windows --out dist/engine && bash packaging/windows/build_win.sh 0.3.2`(Git Bash)。
+Windows 包只能在 Windows 上出(Inno Setup):
+
+```bash
+python packaging/fetch_engine.py --target windows --out dist/engine && bash packaging/windows/build_win.sh 0.3.2   # Git Bash
+```
+
+**装什么、每一步干什么、冒烟怎么测、只出一个 EXE、常见问题:[packaging/windows/README.md](packaging/windows/README.md)**(出 Windows 包前先看那份)。
 
 体积参考:macOS dmg 约 15 MB(引擎解压后 28 MB)。Windows 安装包里 CUDA 12.4 版引擎(263 MB)和 CUDA 运行库(cuBLAS 等,391 MB)占大头,四个官方压缩包合计约 0.7 GB,安装包预计 0.6–0.7 GB;如果只带 CPU + Vulkan,50 MB 以内。
 

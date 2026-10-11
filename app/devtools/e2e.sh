@@ -29,6 +29,14 @@ wait_phase() { for _ in $(seq 1 $(( $3 * 5 ))); do st "$1" | grep -q "\"phase\":
 post() { curl -s -m 5 -X POST -H 'X-Humanizer: 1' -H 'Content-Type: application/json' "http://127.0.0.1:$1$2" -d "${3:-{\}}"; }
 quit() { post "$1" /app/quit >/dev/null 2>&1 || true; }
 alive() { kill -0 "$1" 2>/dev/null; }
+# 启动器报的是系统原生路径(Windows 上是 C:\...),和这里写的 shell 路径写法可能不同,
+# 比之前先归一化。只在不相等时打印,免得混进 check 的输出里。
+pathis() { python3 -c '
+import os, sys
+a, b = os.path.normcase(os.path.abspath(sys.argv[1])), os.path.normcase(os.path.abspath(sys.argv[2]))
+if a != b:
+    print("  路径不同:", a, "≠", b)
+sys.exit(0 if a == b else 1)' "$1" "$2"; }
 
 "$OUT/fakehf" -addr 127.0.0.1:9182 -size 24 -rate 12 -drop-at 5 > "$W/fakehf.log" 2>&1 &
 HF=$!
@@ -146,7 +154,7 @@ check "开启后直接就绪,backend=external,地址已规范化" '[ "$(st 47720
 check "自带引擎进程已经停了" '! pgrep -f "$W/d4/models/humanizer-12b-Q8_0.gguf" >/dev/null'
 check "API key 存成 0600 文件,不在 settings.json 和状态里" '[ "$(python3 -c "import os,sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o777))" "$W/d4/external-api-key")" = 0o600 ] && ! grep -q sk-e2e "$W/d4/settings.json" && ! st 47720 | grep -q sk-e2e'
 SSE=$(curl -s -N -m 20 -X POST -H 'X-Humanizer: 1' -H 'Content-Type: application/json' http://127.0.0.1:47720/api/v1/chat/completions \
-  -d '{"model":"humanizer-12b-q8_0","messages":[{"role":"user","content":"A short draft. It has two sentences."}],"temperature":1.0,"top_p":0.95,"max_tokens":256,"stream":true}')
+  -d '{"model":"humanizer-12b-q8_0","messages":[{"role":"user","content":"A short draft. It has two sentences."}],"temperature":1.0,"top_p":0.95,"temperature":1.0,"top_p":0.95,"max_tokens":256,"stream":true}')
 check "流式改写经启动器反代到外部服务(带 key,收尾 [DONE])" 'echo "$SSE" | grep -q "chat.completion.chunk" && echo "$SSE" | grep -q "data: \[DONE\]" && grep -q "CHAT .*msgs=1" "$W/ext.log"'
 check "外部模式只放行 chat/completions(/api/tokenize 404)" '[ "$(curl -s -o /dev/null -w "%{http_code}" -X POST -H "X-Humanizer: 1" http://127.0.0.1:47720/api/tokenize -d "{}")" = 404 ]'
 check "外部模式下换档被拒(409)" '[ "$(curl -s -o /dev/null -w "%{http_code}" -X POST -H "X-Humanizer: 1" http://127.0.0.1:47720/app/setup -d "{\"tier\":\"q8\"}")" = 409 ]'
@@ -160,6 +168,108 @@ post 47720 /app/external '{"enabled":false,"url":"http://127.0.0.1:9311/v1"}' >/
 wait_phase 47720 ready 20 && sleep 0.3
 check "关掉外部服务:恢复自带引擎" '[ "$(st 47720 | field "d[\"engine\"][\"backend\"]")" = metal ] && grep -q "启动引擎" "$W/l8.log"'
 quit 47720; sleep 1
+
+echo "9. 存储位置:网页上把模型目录改到别处(--data-dir 固定时运行目录不让改,模型目录还能改)"
+# 启动器报的是系统原生路径,和这里写的 shell 路径可能写法不同,所以用 pathis 比
+D4="$W/d7"; G1="$W/gguf"; G2="$W/gguf2"
+mkdir -p "$D4/models"; printf 'GGUF' > "$D4/models/humanizer-12b-Q8_0.gguf"
+"$OUT/humanizer" --data-dir "$D4" --engine "metal=$FAKE" --no-browser --port 47720 --idle-exit 0 > "$W/l9.log" 2>&1 &
+L4=$!
+wait_phase 47720 ready 20 && ok "先就绪" || bad "先就绪"
+check "状态里报告的运行目录就是 --data-dir 给的那个" 'pathis "$(st 47720 | field "d[\"data_dir\"]")" "$D4"'
+check "默认模型目录在运行目录下" 'pathis "$(st 47720 | field "d[\"model_dir\"]")" "$D4/models"'
+check "状态里带默认数据目录(给网页显示「恢复默认」用)" '[ -n "$(st 47720 | field "d[\"default_data_dir\"]")" ]'
+check "--data-dir 给了以后 data_dir_locked=true" '[ "$(st 47720 | field "d[\"data_dir_locked\"]")" = True ]'
+check "改运行目录被拒(启动参数钉死了)" 'post 47720 /app/paths "{\"data_dir\":\"$W/d7-new\"}" | field "bool(d.get(\"error\"))" | grep -q True'
+check "模型目录能改:勾了「一起搬」就把文件挪过去" 'post 47720 /app/paths "{\"model_dir\":\"$G1\",\"move\":true}" | field "d[\"moved\"]" | grep -q "^1$"'
+check "状态里的模型目录跟着变了" 'pathis "$(st 47720 | field "d[\"model_dir\"]")" "$G1"'
+check "模型文件确实在新位置" '[ -f "$G1/humanizer-12b-Q8_0.gguf" ] && [ ! -e "$D4/models/humanizer-12b-Q8_0.gguf" ]'
+check "钉死时模型目录记在运行目录自己的 location.json 里(重启还在)" 'grep -q "\"model_dir\"" "$D4/location.json" && ! grep -q "\"data_dir\"" "$D4/location.json"'
+check "引擎又起来了(用的是新位置那个文件)" 'wait_phase 47720 ready 20'
+mkdir -p "$D4/models"; printf 'GGUF' > "$D4/models/humanizer-12b-Q8_0.gguf"
+check "不勾「一起搬」就不动文件" 'post 47720 /app/paths "{\"model_dir\":\"$G2\"}" | field "d[\"moved\"]" | grep -q "^0$"'
+check "新位置没有凭空多出文件" '[ -f "$D4/models/humanizer-12b-Q8_0.gguf" ] && [ ! -e "$G2/humanizer-12b-Q8_0.gguf" ]'
+check "恢复默认后模型目录回到运行目录下" 'post 47720 /app/paths "{\"reset\":true}" | field "d[\"ok\"]" | grep -q True && pathis "$(st 47720 | field "d[\"model_dir\"]")" "$D4/models"'
+check "恢复默认后模型文件还在原处(本来就还在)" '[ -f "$D4/models/humanizer-12b-Q8_0.gguf" ]'
+check "恢复默认后运行目录里的 location.json 删掉了" '[ ! -e "$D4/location.json" ]'
+check "换完位置后引擎重新就绪" 'wait_phase 47720 ready 30'
+check "pick-dir 拒绝没说的目标" '[ "$(curl -s -m 5 -o /dev/null -w "%{http_code}" -X POST -H "X-Humanizer: 1" http://127.0.0.1:47720/app/pick-dir -d "{\"what\":\"nope\"}")" = 400 ]'
+check "运行目录被钉死时 pick-dir 也拒" '[ "$(curl -s -m 5 -o /dev/null -w "%{http_code}" -X POST -H "X-Humanizer: 1" http://127.0.0.1:47720/app/pick-dir -d "{\"what\":\"data\"}")" = 409 ]'
+quit 47720; sleep 1
+for _ in $(seq 1 50); do alive $L4 || break; sleep 0.2; done
+
+echo "10. 存储位置跨重启:不传 --data-dir 时靠 location.json 找回来"
+# 把"用户主目录"指到临时目录,别去动真的默认数据目录
+H="$PWD/$W/home"; mkdir -p "$H/home-fake"
+run_fake_home() { env HOME="$H" USERPROFILE="$H/home-fake" LOCALAPPDATA="$H" XDG_DATA_HOME="$H" "$@"; }
+HD="$H/Humanizer"  # 假的默认数据目录
+[ "$(uname)" = Darwin ] && HD="$H/Library/Application Support/Humanizer"
+mkdir -p "$W/d8/models"; printf 'GGUF' > "$W/d8/models/humanizer-12b-Q8_0.gguf"
+run_fake_home "$OUT/humanizer" --data-dir "$W/d8" --engine "metal=$FAKE" --no-browser --port 47720 --idle-exit 0 > "$W/l10.log" 2>&1 &
+L5=$!
+wait_phase 47720 ready 20 && ok "先就绪" || bad "先就绪"
+check "运行目录被 --data-dir 钉死时默认目录里不写 location.json" '[ ! -e "$HD/location.json" ]'
+quit 47720; sleep 1
+for _ in $(seq 1 50); do alive $L5 || break; sleep 0.2; done
+# 这次不带 --data-dir:先把指针写好,启动器应该按它找位置
+D6="$PWD/$W/d9"; G3="$PWD/$W/gguf3"  # 启动器只认绝对路径(它自己写的就是绝对路径)
+mkdir -p "$D6/logs" "$G3"
+# 模型放在改过的模型目录里,否则启动器会以为没下过,停在 setup
+printf 'GGUF' > "$G3/humanizer-12b-Q8_0.gguf"
+mkdir -p "$HD"
+printf '{"data_dir": "%s", "model_dir": "%s"}' "$D6" "$G3" > "$HD/location.json"
+run_fake_home "$OUT/humanizer" --engine "metal=$FAKE" --no-browser --port 47720 --idle-exit 0 > "$W/l11.log" 2>&1 &
+L6=$!
+wait_phase 47720 ready 20 && ok "按 location.json 起来了" || bad "按 location.json 起来了"
+check "重启后找回了改过的运行目录" 'pathis "$(st 47720 | field "d[\"data_dir\"]")" "$D6"'
+check "重启后找回了改过的模型目录" 'pathis "$(st 47720 | field "d[\"model_dir\"]")" "$G3"'
+check "启动时日志里也写了模型目录" 'grep -q "模型目录" "$W/l11.log"'
+check "这次运行目录没被钉死,能再改" '[ "$(st 47720 | field "d[\"data_dir_locked\"]")" = False ]'
+check "改过的运行目录里建出了 logs" '[ -d "$D6/logs" ]'
+check "恢复默认会把 location.json 删掉" 'post 47720 /app/paths "{\"reset\":true}" | field "d[\"ok\"]" | grep -q True && [ ! -e "$HD/location.json" ]'
+quit 47720; sleep 1
+for _ in $(seq 1 50); do alive $L6 || break; sleep 0.2; done
+
+echo "11. 外部服务 + 存储位置:外部模式下改运行目录、搬模型不拉起自带引擎;设置和 API key 跟着运行目录走"
+LLAMA_API_KEY=sk-e2e2 "$FAKE" --port 9312 > "$W/ext2.log" 2>&1 &
+EXT=$!
+H="$PWD/$W/home2"; mkdir -p "$H/home-fake"
+HD="$H/Humanizer"
+[ "$(uname)" = Darwin ] && HD="$H/Library/Application Support/Humanizer"
+mkdir -p "$HD/models"; printf 'GGUF' > "$HD/models/humanizer-12b-Q8_0.gguf"; echo '{"tier":"q8"}' > "$HD/settings.json"
+run_fake_home "$OUT/humanizer" --engine "metal=$FAKE" --no-browser --port 47720 --idle-exit 0 > "$W/l12.log" 2>&1 &
+L7=$!
+wait_phase 47720 ready 20 && ok "自带引擎先就绪" || bad "自带引擎先就绪"
+post 47720 /app/external '{"enabled":true,"url":"127.0.0.1:9312","model":"humanizer-12b-q8_0","api_key":"sk-e2e2"}' >/dev/null
+sleep 0.5
+check "开了外部服务" '[ "$(st 47720 | field "d[\"phase\"]+\"/\"+d[\"engine\"][\"backend\"]")" = ready/external ]'
+check "API key 在默认运行目录里" '[ -f "$HD/external-api-key" ]'
+D10="$PWD/$W/run10"
+check "外部模式下改运行目录并搬模型:成功,搬了 1 个文件" 'post 47720 /app/paths "{\"data_dir\":\"$D10\",\"move\":true}" | field "d[\"moved\"]" | grep -q "^1$"'
+sleep 0.5
+check "改完还是外部服务、直接就绪" '[ "$(st 47720 | field "d[\"phase\"]+\"/\"+d[\"engine\"][\"backend\"]+\"/\"+str(d[\"external\"][\"has_key\"])")" = ready/external/True ]'
+check "自带引擎没有被拉起来(日志里只有开头那一次「启动引擎」)" '[ "$(grep -c "启动引擎" "$W/l12.log")" = 1 ] && ! pgrep -f "humanizer-12b-Q8_0.gguf" >/dev/null'
+check "模型搬到了新运行目录下的 models" '[ -f "$D10/models/humanizer-12b-Q8_0.gguf" ] && [ ! -e "$HD/models/humanizer-12b-Q8_0.gguf" ]'
+check "API key 跟到新运行目录(0600),旧目录里删了" '[ "$(python3 -c "import os,sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o777))" "$D10/external-api-key")" = 0o600 ] && [ ! -e "$HD/external-api-key" ]'
+check "外部服务设置写进了新运行目录的 settings.json(不含 key)" 'grep -q "127.0.0.1:9312" "$D10/settings.json" && ! grep -q sk-e2e2 "$D10/settings.json"'
+SSE=$(curl -s -N -m 20 -X POST -H 'X-Humanizer: 1' -H 'Content-Type: application/json' http://127.0.0.1:47720/api/v1/chat/completions \
+  -d '{"model":"humanizer-12b-q8_0","messages":[{"role":"user","content":"A short draft. It has two sentences."}],"temperature":1.0,"top_p":0.95,"max_tokens":256,"stream":true}')
+check "改位置后改写照常经启动器反代(key 还在)" 'echo "$SSE" | grep -q "data: \[DONE\]" && [ "$(grep -c "^CHAT " "$W/ext2.log")" = 1 ]'
+quit 47720; sleep 1
+for _ in $(seq 1 50); do alive $L7 || break; sleep 0.2; done
+run_fake_home "$OUT/humanizer" --engine "metal=$FAKE" --no-browser --port 47720 --idle-exit 0 > "$W/l13.log" 2>&1 &
+L8=$!
+wait_phase 47720 ready 10 && ok "重启(按 location.json 找到新运行目录)后直接就绪" || bad "重启后直接就绪"
+check "重启后运行目录是新的、仍是外部服务、key 读得到" 'pathis "$(st 47720 | field "d[\"data_dir\"]")" "$D10" && [ "$(st 47720 | field "d[\"engine\"][\"backend\"]+\"/\"+str(d[\"external\"][\"has_key\"])")" = external/True ] && ! grep -q "启动引擎" "$W/l13.log"'
+SSE=$(curl -s -N -m 20 -X POST -H 'X-Humanizer: 1' -H 'Content-Type: application/json' http://127.0.0.1:47720/api/v1/chat/completions \
+  -d '{"model":"humanizer-12b-q8_0","messages":[{"role":"user","content":"A short draft. It has two sentences."}],"temperature":1.0,"top_p":0.95,"max_tokens":256,"stream":true}')
+check "重启后改写还能带上 key 过去" 'echo "$SSE" | grep -q "data: \[DONE\]" && [ "$(grep -c "^CHAT " "$W/ext2.log")" = 2 ]'
+post 47720 /app/external '{"enabled":false,"url":"http://127.0.0.1:9312/v1"}' >/dev/null
+wait_phase 47720 ready 20 && sleep 0.3
+check "关掉外部服务:自带引擎从新位置的模型起来" '[ "$(st 47720 | field "d[\"engine\"][\"backend\"]")" = metal ] && pgrep -f "$D10/models/humanizer-12b-Q8_0.gguf" >/dev/null'
+quit 47720; sleep 1
+for _ in $(seq 1 50); do alive $L8 || break; sleep 0.2; done
+{ kill $EXT; wait $EXT; } 2>/dev/null || true
 
 echo
 echo "通过 $PASS 项,失败 $FAILN 项"

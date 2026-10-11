@@ -1,0 +1,87 @@
+# 桌面 App 的测试(不打正式包、不发 Release)。
+#
+# 触发:手动(Actions 页面 → app-test → Run workflow),或推到 main / 合并测试分支 merge-034。
+#   unit     三个系统各跑一遍:go vet / go test / 网页单测 / 端到端(假引擎 + 假下载源,Windows 上不跑 e2e.sh)
+#   windows  用假引擎打一个真的 Inno 安装包,在一次性虚拟机上装、改存储位置、卸载,
+#            核对卸载只删 Humanizer 自己的文件(devtools/win_storage_test.py)
+#
+# 正式出包和发布在 release-app.yml(推 app-v* 标签),和这里无关。
+
+name: app-test
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [merge-034, main]
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUTF8: "1"
+  PYTHONIOENCODING: utf-8
+  GO_VERSION: "1.27.1"
+  INNO_ZH_URL: https://raw.githubusercontent.com/jrsoftware/issrc/6ef32198ef1f7b7b375cd4b6b90896c2a58eb4c2/Files/Languages/ChineseSimplified.isl
+
+defaults:
+  run:
+    shell: bash
+    working-directory: app
+
+jobs:
+  unit:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, macos-14, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+      - name: go vet(三个系统)
+        run: |
+          go vet ./...
+          GOOS=windows go vet ./...
+          GOOS=darwin go vet ./...
+          GOOS=linux go vet ./...
+      - name: go test
+        run: go test -count=1 ./...
+      - name: go test -race
+        if: runner.os != 'Windows'
+        run: go test -race -count=1 ./...
+      - name: 网页单测
+        run: |
+          node devtools/webtest.mjs
+          node devtools/webtest_update.mjs
+      - name: 端到端(假引擎 + 假下载源)
+        if: runner.os != 'Windows'
+        run: bash devtools/e2e.sh
+
+  windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+      - name: 假引擎当三个后端
+        run: |
+          go build -o dist/fakellama.exe ./devtools/fakellama
+          for d in cpu vulkan cuda; do mkdir -p dist/engine/$d && cp dist/fakellama.exe dist/engine/$d/llama-server.exe; done
+      - name: 打安装包(和正式包同一个脚本)
+        run: bash packaging/windows/build_win.sh 0.0.1
+      - name: 装 → 改位置(D 盘中文/空格/长路径)→ 卸载,核对只删自己的文件
+        run: python devtools/win_storage_test.py dist/Humanizer-0.0.1-windows-x64-setup.exe
+      - name: 失败时留下现场
+        if: failure()
+        run: |
+          ls -la "$LOCALAPPDATA/Humanizer" "$LOCALAPPDATA/Humanizer/logs" 2>/dev/null || true
+          cat "$LOCALAPPDATA/Humanizer/logs/launcher.log" 2>/dev/null | tail -50 || true
+          find /d/hz-ci -maxdepth 4 2>/dev/null | head -50 || true
