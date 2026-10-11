@@ -177,6 +177,6 @@ print(json.load(urllib.request.urlopen(req))["content"].strip())
 
 **我的文字会被发到哪里吗**？不会。App 和服务只听 `127.0.0.1`（你自己的电脑），网页也不从网上加载任何东西。唯一的下载就是模型本身。
 
-**怎么卸载**？macOS：删掉 `Humanizer.app` 和 `~/Library/Application Support/Humanizer`。Windows：在「设置 → 应用」里卸载（便携版直接删文件夹），再删掉 `%LOCALAPPDATA%\Humanizer`。如果你在「存储位置」里改过目录，卸载程序会读那个记录，问你要不要把那些目录里 Humanizer 自己的文件也一起删（别的东西不动）；选「否」就都留着，下次重装直接用。
+**怎么卸载**？macOS：删掉 `Humanizer.app` 和 `~/Library/Application Support/Humanizer`（在「存储位置」里改过的话，还有你选的那些文件夹）。Windows：在「设置 → 应用」里卸载（便携版直接删文件夹），再删掉 `%LOCALAPPDATA%\Humanizer`。如果你在「存储位置」里改过目录，卸载程序会读那个记录，问你要不要把那些目录里 Humanizer 自己的文件也一起删（别的东西不动）；选「否」就都留着，下次重装直接用。
 
 **怎么换成更新后的模型**？Hugging Face 上的模型文件在 2026-10-02 更新为 v2（见 [README](../README.zh.md#评测结果)）。App 0.3.2 起，点「…」→「检查更新」就会找到新文件并替你换上。0.3.1 及更早的版本不会替换已经下好的模型：先退出 App，删掉数据目录里 `models` 文件夹中的 `.gguf` 文件（macOS 是 `~/Library/Application Support/Humanizer/models`，Windows 是 `%LOCALAPPDATA%\Humanizer\models`），再打开 App，它会弹出选档页面并下载当前版本。用 `hf download` 的话，再执行一遍同样的命令就会拿到新版。
