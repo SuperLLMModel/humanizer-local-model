@@ -22,6 +22,7 @@ export FAKE_FIXTURES="$APP/devtools/fixtures/samples.json" FAKE_LOAD_MS=500 FAKE
 PASS=0; FAILN=0
 ok()   { echo "  ✓ $1"; PASS=$((PASS+1)); }
 bad()  { echo "  ✗ $1"; FAILN=$((FAILN+1)); }
+# 注意:set -o pipefail 下别写 echo "$X" | grep -q(grep 提前退出,echo 收到 SIGPIPE,整条判失败),用 grep -q … <<<"$X"
 check() { if eval "$2"; then ok "$1"; else bad "$1"; fi; }
 st()   { curl -s -m 2 "http://127.0.0.1:$1/app/status"; }
 field() { python3 -c "import json,sys; d=json.load(sys.stdin); print(eval(sys.argv[1]))" "$1"; }
@@ -72,8 +73,8 @@ b=dict(c["sampling"]); b.update(prompt=c["instr"]+"\n\n"+draft.strip()+c["sep"],
 print(json.dumps(b))')
 SSE=$(curl -sN -m 20 -X POST -H 'X-Humanizer: 1' http://127.0.0.1:47720/api/completion --data "$BODY")
 check "SSE 逐 token 返回" '[ "$(echo "$SSE" | grep -c "^data: ")" -gt 50 ]'
-check "以 EOS 结束(stop_type=eos)" 'echo "$SSE" | grep -q "\"stop_type\":\"eos\""'
-check "吐出的是夹具里的真实输出" 'echo "$SSE" | grep -q "FAANG"'
+check "以 EOS 结束(stop_type=eos)" 'grep -q "\"stop_type\":\"eos\"" <<<"$SSE"'
+check "吐出的是夹具里的真实输出" 'grep -q "FAANG" <<<"$SSE"'
 check "采样参数:T=1.0 top_p=0.95 top_k=0 min_p=0,无 stop 词" 'tail -1 <(grep REQUEST "$W/d1/logs/llama-server.log") | grep -q "\"min_p\":0" && ! grep REQUEST "$W/d1/logs/llama-server.log" | tail -1 | grep -q "\"stop\""'
 EP=$(grep -o -- '--port [0-9]*' "$W/d1/logs/llama-server.log" | tail -1 | awk '{print $2}')
 check "绕过启动器直连引擎(无钥匙)被拒 401" '[ "$(curl -s -o /dev/null -w "%{http_code}" -X POST http://127.0.0.1:$EP/completion -d "{}")" = 401 ]'
@@ -155,7 +156,7 @@ check "自带引擎进程已经停了" '! pgrep -f "$W/d4/models/humanizer-12b-Q
 check "API key 存成 0600 文件,不在 settings.json 和状态里" '[ "$(python3 -c "import os,sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o777))" "$W/d4/external-api-key")" = 0o600 ] && ! grep -q sk-e2e "$W/d4/settings.json" && ! st 47720 | grep -q sk-e2e'
 SSE=$(curl -s -N -m 20 -X POST -H 'X-Humanizer: 1' -H 'Content-Type: application/json' http://127.0.0.1:47720/api/v1/chat/completions \
   -d '{"model":"humanizer-12b-q8_0","messages":[{"role":"user","content":"A short draft. It has two sentences."}],"temperature":1.0,"top_p":0.95,"temperature":1.0,"top_p":0.95,"max_tokens":256,"stream":true}')
-check "流式改写经启动器反代到外部服务(带 key,收尾 [DONE])" 'echo "$SSE" | grep -q "chat.completion.chunk" && echo "$SSE" | grep -q "data: \[DONE\]" && grep -q "CHAT .*msgs=1" "$W/ext.log"'
+check "流式改写经启动器反代到外部服务(带 key,收尾 [DONE])" 'grep -q "chat.completion.chunk" <<<"$SSE" && grep -q "data: \[DONE\]" <<<"$SSE" && grep -q "CHAT .*msgs=1" "$W/ext.log"'
 check "外部模式只放行 chat/completions(/api/tokenize 404)" '[ "$(curl -s -o /dev/null -w "%{http_code}" -X POST -H "X-Humanizer: 1" http://127.0.0.1:47720/api/tokenize -d "{}")" = 404 ]'
 check "外部模式下换档被拒(409)" '[ "$(curl -s -o /dev/null -w "%{http_code}" -X POST -H "X-Humanizer: 1" http://127.0.0.1:47720/app/setup -d "{\"tier\":\"q8\"}")" = 409 ]'
 quit 47720; sleep 1
@@ -254,7 +255,7 @@ check "API key 跟到新运行目录(0600),旧目录里删了" '[ "$(python3 -c 
 check "外部服务设置写进了新运行目录的 settings.json(不含 key)" 'grep -q "127.0.0.1:9312" "$D10/settings.json" && ! grep -q sk-e2e2 "$D10/settings.json"'
 SSE=$(curl -s -N -m 20 -X POST -H 'X-Humanizer: 1' -H 'Content-Type: application/json' http://127.0.0.1:47720/api/v1/chat/completions \
   -d '{"model":"humanizer-12b-q8_0","messages":[{"role":"user","content":"A short draft. It has two sentences."}],"temperature":1.0,"top_p":0.95,"max_tokens":256,"stream":true}')
-check "改位置后改写照常经启动器反代(key 还在)" 'echo "$SSE" | grep -q "data: \[DONE\]" && [ "$(grep -c "^CHAT " "$W/ext2.log")" = 1 ]'
+check "改位置后改写照常经启动器反代(key 还在)" 'grep -q "data: \[DONE\]" <<<"$SSE" && [ "$(grep -c "^CHAT " "$W/ext2.log")" = 1 ]'
 quit 47720; sleep 1
 for _ in $(seq 1 50); do alive $L7 || break; sleep 0.2; done
 run_fake_home "$OUT/humanizer" --engine "metal=$FAKE" --no-browser --port 47720 --idle-exit 0 > "$W/l13.log" 2>&1 &
@@ -263,7 +264,7 @@ wait_phase 47720 ready 10 && ok "重启(按 location.json 找到新运行目录)
 check "重启后运行目录是新的、仍是外部服务、key 读得到" 'pathis "$(st 47720 | field "d[\"data_dir\"]")" "$D10" && [ "$(st 47720 | field "d[\"engine\"][\"backend\"]+\"/\"+str(d[\"external\"][\"has_key\"])")" = external/True ] && ! grep -q "启动引擎" "$W/l13.log"'
 SSE=$(curl -s -N -m 20 -X POST -H 'X-Humanizer: 1' -H 'Content-Type: application/json' http://127.0.0.1:47720/api/v1/chat/completions \
   -d '{"model":"humanizer-12b-q8_0","messages":[{"role":"user","content":"A short draft. It has two sentences."}],"temperature":1.0,"top_p":0.95,"max_tokens":256,"stream":true}')
-check "重启后改写还能带上 key 过去" 'echo "$SSE" | grep -q "data: \[DONE\]" && [ "$(grep -c "^CHAT " "$W/ext2.log")" = 2 ]'
+check "重启后改写还能带上 key 过去" 'grep -q "data: \[DONE\]" <<<"$SSE" && [ "$(grep -c "^CHAT " "$W/ext2.log")" = 2 ]'
 post 47720 /app/external '{"enabled":false,"url":"http://127.0.0.1:9312/v1"}' >/dev/null
 wait_phase 47720 ready 20 && sleep 0.3
 check "关掉外部服务:自带引擎从新位置的模型起来" '[ "$(st 47720 | field "d[\"engine\"][\"backend\"]")" = metal ] && pgrep -f "$D10/models/humanizer-12b-Q8_0.gguf" >/dev/null'
