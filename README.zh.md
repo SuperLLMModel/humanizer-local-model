@@ -14,7 +14,7 @@
 
 **humanizer** 是一个 12B 的改写模型：把 AI 写的草稿（邮件、作文、报告、论坛帖，中英文都行）改成读起来像人写的。训练目标是数字、单位、日期、人名、引语一个不丢，也不往里加东西，而且在你自己的电脑上跑。
 
-**快速开始**：下载 App（**[Mac，Apple 芯片](https://github.com/sgaofen/humanizer-local-model/releases/download/app-v0.3.3/Humanizer-0.3.3-macos-arm64.dmg)** 或 **[Windows](https://github.com/sgaofen/humanizer-local-model/releases/download/app-v0.3.3/Humanizer-0.3.3-windows-x64-setup.exe)**），打开后贴草稿就行，之后完全离线。不用 App：[一行 llama.cpp 命令](#方式二一行命令llamacpp)，或者把 [AGENTS.md](AGENTS.md) 交给你的编程 Agent。
+**快速开始**：下载 App（**[Mac，Apple 芯片](https://github.com/sgaofen/humanizer-local-model/releases/download/app-v0.3.4/Humanizer-0.3.4-macos-arm64.dmg)** 或 **[Windows](https://github.com/sgaofen/humanizer-local-model/releases/download/app-v0.3.4/Humanizer-0.3.4-windows-x64-setup.exe)**），打开后贴草稿就行，之后完全离线。不用 App：[一行 llama.cpp 命令](#方式二一行命令llamacpp)，或者把 [AGENTS.md](AGENTS.md) 交给你的编程 Agent。
 
 ## 改写前后
 
@@ -59,8 +59,8 @@
 
 | 你的电脑 | 下载 |
 |---|---|
-| **Mac**（Apple 芯片，M1 及以后） | [`Humanizer-0.3.3-macos-arm64.dmg`](https://github.com/sgaofen/humanizer-local-model/releases/download/app-v0.3.3/Humanizer-0.3.3-macos-arm64.dmg)，或到 **[Releases](https://github.com/sgaofen/humanizer-local-model/releases/latest)** 下最新版 |
-| **Windows**（x64） | [`Humanizer-0.3.3-windows-x64-setup.exe`](https://github.com/sgaofen/humanizer-local-model/releases/download/app-v0.3.3/Humanizer-0.3.3-windows-x64-setup.exe)（或免安装的 [`.zip`](https://github.com/sgaofen/humanizer-local-model/releases/download/app-v0.3.3/Humanizer-0.3.3-windows-x64-portable.zip)），或到 **[Releases](https://github.com/sgaofen/humanizer-local-model/releases/latest)** 下最新版 |
+| **Mac**（Apple 芯片，M1 及以后） | [`Humanizer-0.3.4-macos-arm64.dmg`](https://github.com/sgaofen/humanizer-local-model/releases/download/app-v0.3.4/Humanizer-0.3.4-macos-arm64.dmg)，或到 **[Releases](https://github.com/sgaofen/humanizer-local-model/releases/latest)** 下最新版 |
+| **Windows**（x64） | [`Humanizer-0.3.4-windows-x64-setup.exe`](https://github.com/sgaofen/humanizer-local-model/releases/download/app-v0.3.4/Humanizer-0.3.4-windows-x64-setup.exe)（或免安装的 [`.zip`](https://github.com/sgaofen/humanizer-local-model/releases/download/app-v0.3.4/Humanizer-0.3.4-windows-x64-portable.zip)），或到 **[Releases](https://github.com/sgaofen/humanizer-local-model/releases/latest)** 下最新版 |
 
 双击后 App 会在浏览器里打开。第一次运行时它会看你的内存、推荐一个档位，从 Hugging Face 下载一次模型；之后完全离线。左边贴草稿，右边流式出改写，新写的部分用荧光笔标出，被改掉的部分在原稿上划掉。在 M5 Max 上，一封百来词的英文邮件约 3.6 秒，一封 300 字左右的中文邮件约 8.5 秒。
 

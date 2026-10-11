@@ -14,7 +14,7 @@
 
 **humanizer** is a 12B model that rewrites AI-written drafts (emails, essays, reports, forum posts; English and Chinese) so they read like a person wrote them. It is trained to keep every number, unit, date, name and quote and to add nothing, and it runs on your own computer.
 
-**Quick start:** get the app for **[Mac (Apple silicon)](https://github.com/sgaofen/humanizer-local-model/releases/download/app-v0.3.3/Humanizer-0.3.3-macos-arm64.dmg)** or **[Windows](https://github.com/sgaofen/humanizer-local-model/releases/download/app-v0.3.3/Humanizer-0.3.3-windows-x64-setup.exe)**, open it and paste a draft; it works offline. Without the app: [one llama.cpp command](#option-2-one-command-llamacpp), or [AGENTS.md](AGENTS.md) for coding agents.
+**Quick start:** get the app for **[Mac (Apple silicon)](https://github.com/sgaofen/humanizer-local-model/releases/download/app-v0.3.4/Humanizer-0.3.4-macos-arm64.dmg)** or **[Windows](https://github.com/sgaofen/humanizer-local-model/releases/download/app-v0.3.4/Humanizer-0.3.4-windows-x64-setup.exe)**, open it and paste a draft; it works offline. Without the app: [one llama.cpp command](#option-2-one-command-llamacpp), or [AGENTS.md](AGENTS.md) for coding agents.
 
 ## Before and after
 
@@ -59,8 +59,8 @@ Most GGUF files come from one `llama-quantize` pass that rounds every weight to 
 
 | Your computer | Download |
 |---|---|
-| **Mac** with Apple silicon (M1 or newer) | [`Humanizer-0.3.3-macos-arm64.dmg`](https://github.com/sgaofen/humanizer-local-model/releases/download/app-v0.3.3/Humanizer-0.3.3-macos-arm64.dmg), or the newest from **[Releases](https://github.com/sgaofen/humanizer-local-model/releases/latest)** |
-| **Windows** (x64) | [`Humanizer-0.3.3-windows-x64-setup.exe`](https://github.com/sgaofen/humanizer-local-model/releases/download/app-v0.3.3/Humanizer-0.3.3-windows-x64-setup.exe) (or the portable [`.zip`](https://github.com/sgaofen/humanizer-local-model/releases/download/app-v0.3.3/Humanizer-0.3.3-windows-x64-portable.zip)), or the newest from **[Releases](https://github.com/sgaofen/humanizer-local-model/releases/latest)** |
+| **Mac** with Apple silicon (M1 or newer) | [`Humanizer-0.3.4-macos-arm64.dmg`](https://github.com/sgaofen/humanizer-local-model/releases/download/app-v0.3.4/Humanizer-0.3.4-macos-arm64.dmg), or the newest from **[Releases](https://github.com/sgaofen/humanizer-local-model/releases/latest)** |
+| **Windows** (x64) | [`Humanizer-0.3.4-windows-x64-setup.exe`](https://github.com/sgaofen/humanizer-local-model/releases/download/app-v0.3.4/Humanizer-0.3.4-windows-x64-setup.exe) (or the portable [`.zip`](https://github.com/sgaofen/humanizer-local-model/releases/download/app-v0.3.4/Humanizer-0.3.4-windows-x64-portable.zip)), or the newest from **[Releases](https://github.com/sgaofen/humanizer-local-model/releases/latest)** |
 
 Double-click it and the app opens in your browser. On first run it looks at your memory, suggests a model size and downloads it once from Hugging Face. After that it works offline. Paste a draft on the left; the rewrite streams in on the right, with new wording highlighted and replaced wording struck through. On an M5 Max a hundred-word email takes about 3.6 seconds.
 
