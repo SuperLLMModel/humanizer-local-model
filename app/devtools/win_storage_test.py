@@ -71,7 +71,8 @@ def uninstall(delete_data):
     env.pop("HUMANIZER_UNINSTALL_DELETE_DATA", None)
     if delete_data:
         env["HUMANIZER_UNINSTALL_DELETE_DATA"] = "1"
-    subprocess.run([os.path.join(INST, "unins000.exe"), "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"],
+    log = os.path.join(os.environ.get("RUNNER_TEMP", LAD), "uninstall.log")
+    subprocess.run([os.path.join(INST, "unins000.exe"), "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/LOG=" + log],
                    env=env, check=True, timeout=300)
     # 卸载程序会把自己复制到临时目录再跑(_iu*.tmp),原进程可能先退出:等它真的做完
     for _ in range(240):
@@ -80,6 +81,12 @@ def uninstall(delete_data):
         time.sleep(0.5)
     time.sleep(1)
     assert not exists(INST, "Humanizer.exe"), "卸载后程序文件还在"
+    try:  # 卸载脚本自己写的两行(读到的 location.json、决定清哪些目录)
+        for line in open(log, encoding="utf-8", errors="replace"):
+            if "location.json:" in line or "要清理" in line:
+                print("    卸载日志:", line.strip().split(" ", 2)[-1])
+    except OSError:
+        pass
 
 
 def api(path, body=None):

@@ -256,12 +256,14 @@ begin
     ModelDir := RemoveBackslash(JsonString(String(Content), 'model_dir'));
   end;
 
+  Log(Format('location.json: data_dir=[%s] model_dir=[%s]', [DataDir, ModelDir]));
   HasDef := DirExists(Def);
   // 运行目录要有 logs\launcher.log(启动器每次启动都写)才认:防止 location.json 被改到一个不相干的目录
   HasData := IsPlainAbsDir(DataDir) and not IsBigDir(DataDir) and not (HasDef and IsInside(DataDir, Def)) and
     DirExists(DataDir) and FileExists(DataDir + '\logs\launcher.log');
   HasModel := IsPlainAbsDir(ModelDir) and not (HasDef and IsInside(ModelDir, Def)) and
     not (HasData and SameDir(ModelDir, DataDir + '\models')) and DirExists(ModelDir);
+  Log(Format('要清理:默认目录=%d 运行目录=%d 模型目录=%d', [Ord(HasDef), Ord(HasData), Ord(HasModel)]));
   if not (HasDef or HasData or HasModel) then Exit;
 
   if GetEnv('HUMANIZER_UNINSTALL_DELETE_DATA') <> '1' then

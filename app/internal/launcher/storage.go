@@ -102,6 +102,11 @@ func (a *App) applyPaths(dataDir, modelDir string, move bool) (moved int, err er
 	a.pauseDownload()
 	a.waitDownloadStopped()
 	a.stopEngine()
+	a.mu.Lock()
+	if a.phase == phaseReady { // 跨盘复制可能要几分钟,这期间别让网页以为还能改写
+		a.phase = phaseStarting
+	}
+	a.mu.Unlock()
 	// 停了就一定要重新判断开机状态,失败了也一样(否则引擎停着、页面还显示就绪)
 	defer a.boot()
 	if move && !samePath(curModels, newModels) {
