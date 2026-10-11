@@ -155,12 +155,14 @@ check "改运行目录被拒(启动参数钉死了)" 'post 47720 /app/paths "{\"
 check "模型目录能改:勾了「一起搬」就把文件挪过去" 'post 47720 /app/paths "{\"model_dir\":\"$G1\",\"move\":true}" | field "d[\"moved\"]" | grep -q "^1$"'
 check "状态里的模型目录跟着变了" 'pathis "$(st 47720 | field "d[\"model_dir\"]")" "$G1"'
 check "模型文件确实在新位置" '[ -f "$G1/humanizer-12b-Q8_0.gguf" ] && [ ! -e "$D4/models/humanizer-12b-Q8_0.gguf" ]'
+check "钉死时模型目录记在运行目录自己的 location.json 里(重启还在)" 'grep -q "\"model_dir\"" "$D4/location.json" && ! grep -q "\"data_dir\"" "$D4/location.json"'
 check "引擎又起来了(用的是新位置那个文件)" 'wait_phase 47720 ready 20'
 mkdir -p "$D4/models"; printf 'GGUF' > "$D4/models/humanizer-12b-Q8_0.gguf"
 check "不勾「一起搬」就不动文件" 'post 47720 /app/paths "{\"model_dir\":\"$G2\"}" | field "d[\"moved\"]" | grep -q "^0$"'
 check "新位置没有凭空多出文件" '[ -f "$D4/models/humanizer-12b-Q8_0.gguf" ] && [ ! -e "$G2/humanizer-12b-Q8_0.gguf" ]'
 check "恢复默认后模型目录回到运行目录下" 'post 47720 /app/paths "{\"reset\":true}" | field "d[\"ok\"]" | grep -q True && pathis "$(st 47720 | field "d[\"model_dir\"]")" "$D4/models"'
 check "恢复默认后模型文件还在原处(本来就还在)" '[ -f "$D4/models/humanizer-12b-Q8_0.gguf" ]'
+check "恢复默认后运行目录里的 location.json 删掉了" '[ ! -e "$D4/location.json" ]'
 check "换完位置后引擎重新就绪" 'wait_phase 47720 ready 30'
 check "pick-dir 拒绝没说的目标" '[ "$(curl -s -m 5 -o /dev/null -w "%{http_code}" -X POST -H "X-Humanizer: 1" http://127.0.0.1:47720/app/pick-dir -d "{\"what\":\"nope\"}")" = 400 ]'
 check "运行目录被钉死时 pick-dir 也拒" '[ "$(curl -s -m 5 -o /dev/null -w "%{http_code}" -X POST -H "X-Humanizer: 1" http://127.0.0.1:47720/app/pick-dir -d "{\"what\":\"data\"}")" = 409 ]'
@@ -171,20 +173,22 @@ echo "9. 存储位置跨重启:不传 --data-dir 时靠 location.json 找回来"
 # 把"用户主目录"指到临时目录,别去动真的默认数据目录
 H="$PWD/$W/home"; mkdir -p "$H/home-fake"
 run_fake_home() { env HOME="$H" USERPROFILE="$H/home-fake" LOCALAPPDATA="$H" XDG_DATA_HOME="$H" "$@"; }
+HD="$H/Humanizer"  # 假的默认数据目录
+[ "$(uname)" = Darwin ] && HD="$H/Library/Application Support/Humanizer"
 mkdir -p "$W/d5/models"; printf 'GGUF' > "$W/d5/models/humanizer-12b-Q8_0.gguf"
 run_fake_home "$OUT/humanizer" --data-dir "$W/d5" --engine "metal=$FAKE" --no-browser --port 47720 --idle-exit 0 > "$W/l8.log" 2>&1 &
 L5=$!
 wait_phase 47720 ready 20 && ok "先就绪" || bad "先就绪"
-check "运行目录被 --data-dir 钉死时不写 location.json" '[ ! -e "$H/Humanizer/location.json" ]'
+check "运行目录被 --data-dir 钉死时默认目录里不写 location.json" '[ ! -e "$HD/location.json" ]'
 quit 47720; sleep 1
 for _ in $(seq 1 50); do alive $L5 || break; sleep 0.2; done
 # 这次不带 --data-dir:先把指针写好,启动器应该按它找位置
-D6="$W/d6"; G3="$W/gguf3"
+D6="$PWD/$W/d6"; G3="$PWD/$W/gguf3"  # 启动器只认绝对路径(它自己写的就是绝对路径)
 mkdir -p "$D6/logs" "$G3"
 # 模型放在改过的模型目录里,否则启动器会以为没下过,停在 setup
 printf 'GGUF' > "$G3/humanizer-12b-Q8_0.gguf"
-mkdir -p "$H/Humanizer"
-printf '{"data_dir": "%s", "model_dir": "%s"}' "$D6" "$G3" > "$H/Humanizer/location.json"
+mkdir -p "$HD"
+printf '{"data_dir": "%s", "model_dir": "%s"}' "$D6" "$G3" > "$HD/location.json"
 run_fake_home "$OUT/humanizer" --engine "metal=$FAKE" --no-browser --port 47720 --idle-exit 0 > "$W/l9.log" 2>&1 &
 L6=$!
 wait_phase 47720 ready 20 && ok "按 location.json 起来了" || bad "按 location.json 起来了"
@@ -193,7 +197,7 @@ check "重启后找回了改过的模型目录" 'pathis "$(st 47720 | field "d[\
 check "启动时日志里也写了模型目录" 'grep -q "模型目录" "$W/l9.log"'
 check "这次运行目录没被钉死,能再改" '[ "$(st 47720 | field "d[\"data_dir_locked\"]")" = False ]'
 check "改过的运行目录里建出了 logs" '[ -d "$D6/logs" ]'
-check "恢复默认会把 location.json 删掉" 'post 47720 /app/paths "{\"reset\":true}" | field "d[\"ok\"]" | grep -q True && [ ! -e "$H/Humanizer/location.json" ]'
+check "恢复默认会把 location.json 删掉" 'post 47720 /app/paths "{\"reset\":true}" | field "d[\"ok\"]" | grep -q True && [ ! -e "$HD/location.json" ]'
 quit 47720; sleep 1
 for _ in $(seq 1 50); do alive $L6 || break; sleep 0.2; done
 
