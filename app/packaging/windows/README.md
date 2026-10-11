@@ -153,7 +153,7 @@ rm -rf dist/win/engine/vulkan dist/win/engine/cuda
 | `7z: command not found`,最后 `ls` 报错 | 没装 7-Zip | 装上,或者手动 `cd dist/win && zip -r ../portable.zip .` |
 | `go: downloading …` 卡住 / `proxy.golang.org` 超时 | `go-winres` 要联网 | `export GOPROXY=https://goproxy.cn,direct` |
 | 双击 EXE 什么反应都没有 | 引擎或 DLL 缺失,或者被 SmartScreen 拦了 | 先看有没有弹 SmartScreen;再从命令行加 `--no-browser` 跑,看有没有报错;确认 `engine/` 目录跟着 exe 在一起 |
-| 换了存储位置后卸载没删掉模型 | 卸载器只问默认目录和 `location.json` 里记的目录 | 手动删;或在网页上「恢复默认」再卸载 |
+| 换了存储位置后卸载没删掉模型 | 卸载时选了「否」,或者是静默卸载(默认不删数据);自己选的文件夹里只删 Humanizer 的文件,别的不动 | 手动删;脚本化卸载可以设 `HUMANIZER_UNINSTALL_DELETE_DATA=1` |
 | 中文在 Windows 控制台里是乱码 | 控制台是 cp1252 | `PYTHONUTF8=1 PYTHONIOENCODING=utf-8 python packaging/fetch_engine.py …`(CI 里就是这么设的) |
 
 ## 和 CI 的关系

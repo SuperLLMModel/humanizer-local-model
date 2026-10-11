@@ -6,7 +6,8 @@
 ;
 ; 按用户安装(不需要管理员权限),装到 %LOCALAPPDATA%\Programs\Humanizer;
 ; 模型和日志默认在 %LOCALAPPDATA%\Humanizer(启动器管),可以在网页上的「存储位置」里改。
-; 卸载时读 location.json,问要不要连改过的那个目录一起删。
+; 卸载时问要不要连数据一起删:默认目录整个删;location.json 里记的、用户自己选的目录只删 Humanizer 自己的文件。
+; 静默卸载默认不删数据;设环境变量 HUMANIZER_UNINSTALL_DELETE_DATA=1 则不问直接删(脚本化卸载、CI 用)。
 
 #ifndef AppVersion
   #define AppVersion "0.0.0-dev"
@@ -64,63 +65,217 @@ Filename: "{sys}\taskkill.exe"; Parameters: "/f /im Humanizer.exe"; Flags: runhi
 [CustomMessages]
 en.AskDeleteModels=Also delete the downloaded models and logs?%n%n%1%n%nThe model files are large (several GB). Choose No to keep them for a later reinstall.
 zh.AskDeleteModels=要不要把已下载的模型和日志也一起删掉？%n%n%1%n%n模型文件很大（几个 GB）。选「否」可以留着，下次重装直接用。
+en.OnlyOurFiles=(only Humanizer's own files; anything else in this folder stays)
+zh.OnlyOurFiles=（只删 Humanizer 自己的文件，这个文件夹里别的东西不动）
 
 [Code]
-// 从 location.json 里读出一个字符串字段的值。
-// 只处理"key": "value" 这种形态(启动器写出来的就是它),解析不了就返回空串,
-// 调用方按默认目录处理。
-function ReadLocationField(const Key: String): String;
+// 卸载时清理数据。安全规则:
+//   - 默认目录 %LOCALAPPDATA%\Humanizer 是我们自己的,整个删(DelTree 不会钻进符号链接/目录联接里删);
+//   - location.json 里记的运行目录、模型目录是用户自己选的,可能和别的文件放在一起,
+//     只按名字删 Humanizer 写过的文件,再删掉已经空了的文件夹;
+//   - location.json 读不懂、路径不是普通的绝对路径、指到盘符根/用户目录/系统目录,一律当没设过。
+
+// 从 location.json 的内容里取一个字符串字段。启动器写的是纯 ASCII(非 ASCII 一律 \uXXXX,
+// 见 paths.go 的 locationJSON),这里只认这种写法;看不懂就返回空串。
+function JsonString(const S, Key: String): String;
 var
-  Content, P, Colon, Q1, Q2, Value: String;
+  I, N, Code: Integer;
+  C: Char;
+  V, Hex: String;
 begin
   Result := '';
-  if not LoadStringFromFile(ExpandConstant('{localappdata}\Humanizer\location.json'), Content) then
-    Exit;
-  P := Pos('"' + Key + '"', Content);
-  if P = 0 then Exit;
-  Colon := PosEx(':', Content, P);
-  if Colon = 0 then Exit;
-  Q1 := PosEx('"', Content, Colon);            // 值的左引号
-  if Q1 = 0 then Exit;
-  Q2 := PosEx('"', Content, Q1 + 1);          // 值的右引号
-  if Q2 = 0 then Exit;
-  Value := Copy(Content, Q1 + 1, Q2 - Q1 - 1);
-  // JSON 里反斜杠是转义的,还原回来(Pascal 字面量 '\\' 就是两个反斜杠)
-  StringChange(Value, '\\', '\');
-  Result := Value;
+  I := Pos('"' + Key + '"', S);
+  if I = 0 then Exit;
+  I := I + Length(Key) + 2;
+  N := Length(S);
+  while (I <= N) and ((S[I] = ' ') or (S[I] = ':') or (S[I] = #9) or (S[I] = #10) or (S[I] = #13)) do
+    I := I + 1;
+  if (I > N) or (S[I] <> '"') then Exit;
+  I := I + 1;
+  V := '';
+  while I <= N do
+  begin
+    C := S[I];
+    if C = '"' then
+    begin
+      Result := V;
+      Exit;
+    end;
+    if (Ord(C) < 32) or (Ord(C) > 126) then Exit;
+    if C <> '\' then
+    begin
+      V := V + C;
+      I := I + 1;
+    end
+    else
+    begin
+      if I = N then Exit;
+      C := S[I + 1];
+      if (C = '"') or (C = '\') or (C = '/') then
+      begin
+        V := V + C;
+        I := I + 2;
+      end
+      else if C = 'u' then
+      begin
+        Hex := Copy(S, I + 2, 4);
+        Code := StrToIntDef('$' + Hex, -1);
+        if (Length(Hex) <> 4) or (Code < 32) then Exit;
+        V := V + Chr(Code);
+        I := I + 6;
+      end
+      else
+        Exit;
+    end;
+  end;
 end;
 
-// 盘根(C:\、D:\ 这类)一律不删:数据目录是用户自己填的路径,
-// 万一填成了盘根,卸载不能跟着把整盘删掉。
-function IsDeletableDir(const Dir: String): Boolean;
+// 是不是一个"普通"的绝对路径:X:\a\b 或 \\server\share\a;不能是盘符根、共享根,
+// 不能带 /、.、..(手改坏或者故意篡改的 location.json)。
+function IsPlainAbsDir(const S: String): Boolean;
 var
-  S: String;
+  I, Slashes: Integer;
+  T: String;
 begin
-  S := RemoveBackslash(Dir);
-  Result := (Pos(':', S) = 0) or (Length(S) > 3);
+  Result := False;
+  T := S + '\';
+  if (Length(S) < 4) or (Pos('/', S) > 0) or (Pos('\..\', T) > 0) or (Pos('\.\', T) > 0) or (Pos('\\', Copy(T, 3, Length(T))) > 0) then
+    Exit;
+  if (S[2] = ':') and (S[3] = '\') then
+    Result := ((S[1] >= 'A') and (S[1] <= 'Z')) or ((S[1] >= 'a') and (S[1] <= 'z'))
+  else if (Copy(S, 1, 2) = '\\') and (S[3] <> '?') and (S[3] <> '.') then
+  begin
+    Slashes := 0;
+    for I := 1 to Length(S) do
+      if S[I] = '\' then Slashes := Slashes + 1;
+    Result := Slashes >= 4; // \\server\share\folder
+  end;
 end;
 
-// 卸载时要清理的目录:优先用户在网页上改过的运行目录,其次模型目录,最后默认目录。
+function SameDir(const A, B: String): Boolean;
+begin
+  Result := CompareText(RemoveBackslash(A), RemoveBackslash(B)) = 0;
+end;
+
+// A 在 B 里面(或就是 B)
+function IsInside(const A, B: String): Boolean;
+begin
+  Result := Pos(Lowercase(AddBackslash(B)), Lowercase(AddBackslash(A))) = 1;
+end;
+
+// 用户目录、桌面、文档、系统目录这类大目录:运行目录不可能是它们(启动器只用空文件夹或自己建的子文件夹),
+// location.json 指到这里只能是被改坏了,一律不碰。
+function IsBigDir(const D: String): Boolean;
+begin
+  Result := SameDir(D, GetEnv('USERPROFILE')) or SameDir(D, ExpandConstant('{userdocs}')) or
+    SameDir(D, ExpandConstant('{userdesktop}')) or SameDir(D, ExpandConstant('{localappdata}')) or
+    SameDir(D, ExpandConstant('{userappdata}')) or SameDir(D, ExpandConstant('{win}')) or
+    SameDir(D, ExpandConstant('{sys}')) or SameDir(D, ExpandConstant('{commonpf}')) or
+    SameDir(D, ExpandConstant('{commonpf32}')) or SameDir(D, GetEnv('USERPROFILE') + '\Downloads') or
+    SameDir(D, ExpandConstant('{localappdata}\Programs'));
+end;
+
+// Dir 里名字以 Prefix 开头(不分大小写)、又含 Part 的条目删掉;WithDirs 时同名的子目录也删。
+// 名字再核一遍,不只靠通配符(Windows 的通配符还会去匹配 8.3 短文件名)。
+procedure DeleteNamed(const Dir, Prefix, Part: String; WithDirs: Boolean);
+var
+  F: TFindRec;
+  N: String;
+begin
+  if FindFirst(AddBackslash(Dir) + Prefix + '*', F) then
+  try
+    repeat
+      N := Lowercase(F.Name);
+      if (Pos(Lowercase(Prefix), N) = 1) and ((Part = '') or (Pos(Lowercase(Part), N) > 0)) then
+      begin
+        if (F.Attributes and FILE_ATTRIBUTE_DIRECTORY) = 0 then
+          DeleteFile(AddBackslash(Dir) + F.Name)
+        else if WithDirs then
+          DelTree(AddBackslash(Dir) + F.Name, True, True, True);
+      end;
+    until not FindNext(F);
+  finally
+    FindClose(F);
+  end;
+end;
+
+// 模型目录:只删档位文件 humanizer-*.gguf 及其半截/更新/备份文件(.part、.update、.bak…)。
+procedure CleanModelDir(const Dir: String);
+begin
+  DeleteNamed(Dir, 'humanizer-', '.gguf', False);
+  DeleteNamed(Dir + '\lite', 'humanizer-', '.gguf', False);
+  RemoveDir(Dir + '\lite');
+  RemoveDir(Dir);
+end;
+
+// 运行目录:只删启动器写的那几个文件和子目录里的东西,最后文件夹空了才删。
+procedure DeleteWithTmp(const Dir, Name: String);
+begin
+  DeleteFile(Dir + '\' + Name);
+  DeleteFile(Dir + '\' + Name + '.tmp'); // 原子写入时的临时文件
+end;
+
+procedure CleanRunDir(const Dir: String);
+begin
+  DeleteWithTmp(Dir, 'settings.json');
+  DeleteWithTmp(Dir, 'config.json');
+  DeleteWithTmp(Dir, 'instance.json');
+  DeleteWithTmp(Dir, 'location.json');
+  DeleteWithTmp(Dir, 'update-state.json');
+  DeleteWithTmp(Dir, 'update-result.json');
+  DeleteWithTmp(Dir, 'model-hashes.json');
+  DeleteFile(Dir + '\.humanizer-write-test');
+  DeleteNamed(Dir + '\logs', 'launcher.log', '', False);
+  DeleteNamed(Dir + '\logs', 'llama-server.log', '', False);
+  DeleteNamed(Dir + '\logs', 'update.log', '', False);
+  DeleteNamed(Dir + '\logs', 'update-install.log', '', False);
+  RemoveDir(Dir + '\logs');
+  // 下载的新版安装包(Humanizer-<版本>-…)、更新助手(humanizer-updater…)和它的计划
+  DeleteNamed(Dir + '\updates', 'humanizer-', '', True);
+  DeleteFile(Dir + '\updates\apply-plan.json');
+  RemoveDir(Dir + '\updates');
+  CleanModelDir(Dir + '\models');
+  RemoveDir(Dir);
+end;
+
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
-  DataDir, ModelDir: String;
-  Dirs: array[0..1] of String;
-  I, N: Integer;
+  Def, DataDir, ModelDir, List: String;
+  Content: AnsiString;
+  HasDef, HasData, HasModel: Boolean;
 begin
   if CurUninstallStep <> usPostUninstall then Exit;
 
-  DataDir := ReadLocationField('data_dir');
-  ModelDir := ReadLocationField('model_dir');
-  if DataDir = '' then
-    DataDir := ExpandConstant('{localappdata}\Humanizer');
+  Def := ExpandConstant('{localappdata}\Humanizer');
+  // 先读 location.json:它就在默认目录里,删了就读不到了
+  DataDir := '';
+  ModelDir := '';
+  if LoadStringFromFile(Def + '\location.json', Content) then
+  begin
+    DataDir := RemoveBackslash(JsonString(String(Content), 'data_dir'));
+    ModelDir := RemoveBackslash(JsonString(String(Content), 'model_dir'));
+  end;
 
-  N := 0;
-  if DirExists(DataDir) and IsDeletableDir(DataDir) then begin Dirs[N] := DataDir; Inc(N); end;
-  // 模型目录单独放在外面(没设过就等于数据目录下的 models,那时不用再问一遍)
-  if (ModelDir <> '') and (ModelDir <> DataDir) and DirExists(ModelDir) and IsDeletableDir(ModelDir) then begin Dirs[N] := ModelDir; Inc(N); end;
+  HasDef := DirExists(Def);
+  // 运行目录要有 logs\launcher.log(启动器每次启动都写)才认:防止 location.json 被改到一个不相干的目录
+  HasData := IsPlainAbsDir(DataDir) and not IsBigDir(DataDir) and not (HasDef and IsInside(DataDir, Def)) and
+    DirExists(DataDir) and FileExists(DataDir + '\logs\launcher.log');
+  HasModel := IsPlainAbsDir(ModelDir) and not (HasDef and IsInside(ModelDir, Def)) and
+    not (HasData and SameDir(ModelDir, DataDir + '\models')) and DirExists(ModelDir);
+  if not (HasDef or HasData or HasModel) then Exit;
 
-  for I := 0 to N - 1 do
-    if not UninstallSilent then
-      if MsgBox(FmtMessage(CustomMessage('AskDeleteModels'), [Dirs[I]]), mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES then
-        DelTree(Dirs[I], True, True, True);
+  if GetEnv('HUMANIZER_UNINSTALL_DELETE_DATA') <> '1' then
+  begin
+    if UninstallSilent then Exit;
+    List := '';
+    if HasDef then List := List + Def + #13#10;
+    if HasData then List := List + DataDir + ' ' + CustomMessage('OnlyOurFiles') + #13#10;
+    if HasModel then List := List + ModelDir + ' ' + CustomMessage('OnlyOurFiles') + #13#10;
+    if MsgBox(FmtMessage(CustomMessage('AskDeleteModels'), [Trim(List)]), mbConfirmation, MB_YESNO or MB_DEFBUTTON2) <> IDYES then
+      Exit;
+  end;
+
+  if HasDef then DelTree(Def, True, True, True);
+  if HasData then CleanRunDir(DataDir);
+  if HasModel then CleanModelDir(ModelDir);
 end;
