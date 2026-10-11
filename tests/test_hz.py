@@ -40,8 +40,9 @@ class Fake:
     """mode 'server': llama-server (/health, /props, /tokenize, /completion).
     mode 'app': the Humanizer app (/app/status, /api/tokenize, /api/completion; POSTs need X-Humanizer: 1)."""
 
-    def __init__(self, mode='server', rule=None, phases=None):
+    def __init__(self, mode='server', rule=None, phases=None, status=None):
         self.mode, self.requests, self.calls = mode, [], Counter()
+        self.status = dict(status or {})            # extra /app/status fields (e.g. external service)
         self.rule = rule or (lambda draft, n: reverse_words(draft))
         self.phases = list(phases or [])           # app phases to report before 'ready'
         fake = self
@@ -61,7 +62,7 @@ class Fake:
             def do_GET(self):
                 if fake.mode == 'app' and self.path == '/app/status':
                     phase = fake.phases.pop(0) if fake.phases else 'ready'
-                    return self._send(200, {'app': 'humanizer', 'phase': phase, 'tier': 'q8'})
+                    return self._send(200, {'app': 'humanizer', 'phase': phase, 'tier': 'q8', **fake.status})
                 if fake.mode == 'server' and self.path == '/health':
                     return self._send(200, {'status': 'ok'})
                 if fake.mode == 'server' and self.path == '/props':
@@ -395,6 +396,58 @@ class TestEndToEnd(ServerCase):
         self.assertEqual(code, 0, err)
         self.assertIn('\r\n', out)
         self.assertIn('1,250', out)
+
+
+class TestDiscoveryAllAppUrls(ServerCase):
+    """find_backend() with no flags: every app URL is looked at before a non-ready one is reported (issue #10)."""
+
+    def find(self, *fakes):
+        urls = [f.url for f in fakes]
+        with mock.patch.object(hz, 'app_urls', lambda: list(urls)), \
+                mock.patch.object(hz, 'server_state', lambda url: None), \
+                mock.patch.object(hz, 'launch_app', lambda out: False):
+            return hz.find_backend(None, None, hz.Out(quiet=True))
+
+    def test_ready_app_after_stale_app(self):
+        # the issue's case: first URL answers phase "setup", second answers "ready" with tier q8
+        stale, good = self.fake('app', phases=['setup'] * 50), self.fake('app')
+        b = self.find(stale, good)
+        self.assertEqual((b.kind, b.url, b.model), ('app', good.url, 'q8'))
+        with mock.patch.object(hz, 'app_urls', lambda: [stale.url, good.url]), \
+                mock.patch.object(hz, 'server_state', lambda url: None):
+            code, out, err = run_hz('--quiet', stdin=(para(1) + '\n').encode())
+        self.assertEqual(code, 0, err)
+        self.assertEqual(out.strip(), reverse_words(para(1)))
+        self.assertEqual(len(good.completions()), 1)
+        self.assertEqual(stale.completions(), [])
+
+    def test_ready_beats_loading(self):
+        loading, good = self.fake('app', phases=['starting'] * 50), self.fake('app')
+        self.assertEqual(self.find(loading, good).url, good.url)
+
+    def test_loading_app_used_when_none_ready(self):
+        stale, loading = self.fake('app', phases=['setup'] * 50), self.fake('app', phases=['starting'] * 3)
+        b = self.find(stale, loading)
+        self.assertEqual((b.url, b.model), (loading.url, 'q8'))
+
+    def test_only_non_ready_apps_report_the_first(self):
+        a, b = self.fake('app', phases=['setup'] * 50), self.fake('app', phases=['paused'] * 50)
+        with self.assertRaises(hz.HzError) as cm:
+            self.find(a, b)
+        self.assertEqual(cm.exception.code, 3)
+        self.assertIn('no model yet', str(cm.exception))
+        self.assertIn(a.url, str(cm.exception))
+
+    def test_app_on_external_service_is_skipped(self):
+        ext = {'external': {'enabled': True, 'url': 'http://localhost:1234/v1'}}
+        other, good = self.fake('app', status=ext), self.fake('app')
+        self.assertEqual(self.find(other, good).url, good.url)
+        with self.assertRaises(hz.HzError) as cm:
+            self.find(self.fake('app', status=ext))
+        self.assertIn('external model service', str(cm.exception))
+        self.assertIn('http://localhost:1234/v1', str(cm.exception))
+        with self.assertRaises(hz.HzError):           # --app pointed at it: same explanation, no 404 later
+            hz.find_backend(None, other.url, hz.Out(quiet=True))
 
 
 class TestRetry(ServerCase):

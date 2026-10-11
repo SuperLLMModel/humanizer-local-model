@@ -291,8 +291,19 @@ def _open_page(url: str):
         pass
 
 
+def _app_external(d: dict) -> bool:
+    """The app (0.3.4+) is set to send rewrites to an external OpenAI-compatible service; its /api/completion is off."""
+    ext = d.get("external")
+    return isinstance(ext, dict) and bool(ext.get("enabled"))
+
+
 def _app_problem(url: str, d: dict) -> str:
     ph, page = d.get("phase"), url + "/"
+    if _app_external(d):
+        ext = (d.get("external") or {}).get("url") or "an external service"
+        return (f"the Humanizer app at {page} is set to use an external model service ({ext}), so hz cannot "
+                "rewrite through it. Turn off \"External model service\" in the app's \u2026 menu, or, if that "
+                "service is llama-server, run hz --server with its address (without /v1).")
     if ph == "setup":
         return f"the Humanizer app has no model yet. Open {page} , pick a model size, let it download, then run hz again."
     if ph == "paused":
@@ -326,6 +337,8 @@ def _wait_app(urls: Callable[[], List[str]], out: Out, launched: bool = False,
                 url = u
                 break
         ph = d.get("phase") if d else None
+        if d and _app_external(d):
+            raise HzError(_app_problem(url, d), 3)
         if d and ph == "ready":
             return Backend("app", url, d.get("tier") or "")
         if d and ph in ("setup", "paused", "error"):
@@ -393,15 +406,24 @@ def find_backend(server: Optional[str], app: Optional[str], out: Out, no_launch:
         if app_status(url):
             return _wait_app(lambda: [url], out)
         raise HzError(f"the Humanizer app is not running at {url}.", 3)
-    pending = None
+    # Look at every candidate app URL (instance.json's port, then 47615) before deciding: a stale or
+    # unconfigured instance on the first URL must not hide a ready app on the next one (issue #10).
+    # A ready app wins at once; else one that is loading or downloading; a non-ready app (setup /
+    # paused / error / external service) is kept only to explain the failure if nothing else works.
+    loading = pending = None
     for url in app_urls():
         d = app_status(url)
         if d is None:
             continue
-        if d.get("phase") in ("ready", "starting", "downloading"):
+        ph = d.get("phase")
+        if ph == "ready" and not _app_external(d):
             return _wait_app(lambda u=url: [u], out)
-        pending = (url, d)
-        break
+        if ph in ("starting", "downloading") and not _app_external(d):
+            loading = loading or url
+        elif pending is None:
+            pending = (url, d)
+    if loading:
+        return _wait_app(lambda u=loading: [u], out)
     st = server_state(SERVER_URL)
     if st == "ok":
         return _server(SERVER_URL, out)
