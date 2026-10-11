@@ -19,6 +19,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -226,6 +227,8 @@ func probeExternal(ctx context.Context, base, key string) ([]string, int, error)
 		}
 	}
 	sort.Strings(ids)
+	// llama-server 的 /v1/models 同时给 OpenAI 的 data 和 Ollama 风格的 models,同一个模型会出现两次
+	ids = slices.Compact(ids)
 	return ids, resp.StatusCode, nil
 }
 

@@ -720,6 +720,12 @@ async function run() {
   const draft = $('draft').value;
   if (!pyStrip(draft)) return;
   if (!S.promptOK || !S.cfg) { showNotice('err', t('out.promptMismatch')); return; }
+  // 外部服务的开关、存储位置可能刚在别处改过(另一个标签页、后台标签页轮询慢),先对一次状态,
+  // 免得按旧状态把请求发到已经不存在的接口(0.3.4 真机测出:关掉外部服务后旧页面报「外部服务 404」)
+  if (S.checking) return;
+  S.checking = true;
+  try { S.status = await getJSON('/app/status', { timeout: 3000 }); render(); } catch { /* 连不上就按手上的状态走 */ } finally { S.checking = false; }
+  if (S.running) return;
   if (S.status?.phase !== 'ready') { toast(t('out.notReady')); return; }
   // 这篇草稿有没改完的分段进度(停止过、出过错、刷新过页面):接着改,已完成的段不再送进引擎
   if (resumableJob(draft)) { await runDocument(draft, true); return; }

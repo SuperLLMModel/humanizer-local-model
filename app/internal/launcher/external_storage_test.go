@@ -133,3 +133,15 @@ func TestInflightCountsExternalChat(t *testing.T) {
 		t.Fatalf("外部服务的改写请求没计数:%d", seen)
 	}
 }
+
+// llama-server 的 /v1/models 同时回 data 和 models 两份列表:测试连接时同一个模型只列一次(mini 真引擎测出来的)。
+func TestProbeExternalDedupesLlamaServerModels(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"models":[{"name":"humanizer","model":"humanizer"}],"object":"list","data":[{"id":"humanizer","object":"model"}]}`))
+	}))
+	defer srv.Close()
+	ids, _, err := probeExternal(t.Context(), srv.URL+"/v1", "")
+	if err != nil || len(ids) != 1 || ids[0] != "humanizer" {
+		t.Fatalf("模型列表应只有一个 humanizer:%v %v", ids, err)
+	}
+}

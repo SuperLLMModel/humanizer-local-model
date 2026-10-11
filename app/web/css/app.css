@@ -437,7 +437,7 @@ textarea#draft { position: relative; z-index: 1; }
 .setup-notice { margin: -6px 0 16px; padding: 10px 12px; border-radius: 10px; font-size: 13px; line-height: 1.55; color: var(--ink); background: var(--sheet-2, rgba(127,127,127,.10)); border: 1px solid var(--line); }
 .tiers { display: grid; gap: 8px; margin-bottom: 18px; }
 .tier {
-  display: grid; grid-template-columns: 20px 1fr auto; align-items: center; gap: 14px; padding: 14px 16px;
+  display: grid; grid-template-columns: 20px minmax(0, 1fr) auto; align-items: center; gap: 14px; padding: 14px 16px;
   border: 1px solid var(--line); border-radius: 14px; text-align: left; transition: border-color .15s, background .15s;
 }
 .tier:hover { border-color: var(--ink-4); }
@@ -445,7 +445,7 @@ textarea#draft { position: relative; z-index: 1; }
 .radio { width: 18px; height: 18px; border-radius: 50%; border: 1.5px solid var(--ink-4); display: grid; place-items: center; }
 .tier[aria-checked="true"] .radio { border-color: var(--ink); }
 .tier[aria-checked="true"] .radio::after { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--ink); }
-.tier-name { display: flex; align-items: center; gap: 8px; font-family: var(--f-mono); font-weight: 700; font-size: 14px; }
+.tier-name { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; font-family: var(--f-mono); font-weight: 700; font-size: 14px; }
 .tier-note { display: block; font-size: 12.5px; color: var(--ink-3); margin-top: 2px; }
 .tier-size { text-align: right; font-family: var(--f-mono); font-size: 12.5px; color: var(--ink); }
 .tier-size small { display: block; color: var(--ink-3); font-size: 11px; margin-top: 2px; }
@@ -613,6 +613,13 @@ textarea#draft { position: relative; z-index: 1; }
   .status { margin-right: 2px; }
   .seg { margin: 0 2px; }
   .seg button { min-width: 30px; padding: 0 7px; }
+}
+@media (max-width: 480px) { /* 存储位置:手机宽度上标签单独一行,输入框占满剩下的宽度,路径别只露出几个字 */
+  .path-row { grid-template-columns: minmax(0, 1fr) auto; gap: 6px 8px; }
+  .path-label { grid-column: 1 / -1; }
+  .path-btn { padding: 0 8px; }
+  .tier { gap: 10px; padding: 12px; } /* 档位卡片别撑出卡片右边(徽章折行、大小那列不再挤成一字一行) */
+  .tier-size { white-space: nowrap; }
 }
 @media (max-width: 370px) { .brand-word { font-size: 17px; } .brand-mark { width: 26px; } }
 @media (max-width: 560px) {
