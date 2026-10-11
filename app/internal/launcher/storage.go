@@ -89,6 +89,9 @@ func (a *App) applyPaths(dataDir, modelDir string, move bool) (moved int, err er
 		}
 		wantModels = p
 	}
+	if samePath(wantModels, filepath.Join(wantData, "models")) {
+		wantModels = "" // 就是默认位置:记成"跟着运行目录走"
+	}
 	newModels := wantModels
 	if newModels == "" {
 		newModels = filepath.Join(wantData, "models")

@@ -540,3 +540,24 @@ func TestApplyPathsRunDirNeverMixesWithUserFiles(t *testing.T) {
 		t.Fatalf("报错时位置不该变:%s", a.dataDir)
 	}
 }
+
+// 只改运行目录、模型目录还是默认的:模型目录跟着新运行目录走(勾了「一起搬」就搬过去)。
+func TestApplyPathsDefaultModelsFollowRunDir(t *testing.T) {
+	tmp := fakeHome(t)
+	a := testApp(t)
+	a.pointerDir = defaultDataDir()
+	old := filepath.Join(a.dataDir, "models")
+	os.MkdirAll(old, 0o755)
+	os.WriteFile(filepath.Join(old, "humanizer-12b-Q8_0.gguf"), []byte("GGUF"), 0o644)
+	next := filepath.Join(tmp, "next")
+	// 网页把显示着的默认模型目录也发过来了:应当认成"默认",而不是钉在旧位置
+	if _, err := a.applyPaths(next, filepath.Join(next, "models"), true); err != nil {
+		t.Fatal(err)
+	}
+	if a.locModelDir != "" || !fileExists(filepath.Join(next, "models", "humanizer-12b-Q8_0.gguf")) {
+		t.Fatalf("模型目录应跟着运行目录走并搬过去:loc=%q", a.locModelDir)
+	}
+	if loc, _ := readLocation(defaultDataDir()); loc.ModelDir != "" {
+		t.Fatalf("location.json 不该记默认的模型目录:%+v", loc)
+	}
+}

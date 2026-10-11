@@ -8,7 +8,7 @@ import { countText, isMostlyCJK, isLongDraft, numberCheck, fmtBytes, fmtDuration
 import { loadHistory, addHistory, removeHistory, clearHistory, store } from './history.js';
 import { SAMPLES } from './samples.js';
 import { activeFacts, protectFacts, restoreFacts, streamView, withFactGuard, FACT_TRIES } from './facts.js';
-import { pathsHintKey, modelDirDefault } from './paths.js';
+import { pathsHintKey, modelDirDefault, sameDir } from './paths.js';
 
 const $ = (id) => document.getElementById(id);
 const params = new URLSearchParams(location.search);
@@ -292,9 +292,12 @@ async function savePaths(reset) {
   S.savingPaths = true;
   renderPaths();
   try {
+    // 模型目录没动过、本来就是默认的(运行目录下的 models):发空,让它跟着新的运行目录走
+    let model = $('path-model').value.trim();
+    if (sameDir(model, S.status?.model_dir) && sameDir(model, modelDirDefault(S.status || {}))) model = '';
     const r = await postJSON('/app/paths', {
       data_dir: reset ? '' : $('path-data').value.trim(),
-      model_dir: reset ? '' : $('path-model').value.trim(),
+      model_dir: reset ? '' : model,
       move: !reset && $('path-move').checked,
       reset,
     });

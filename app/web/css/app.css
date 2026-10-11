@@ -498,7 +498,7 @@ textarea#draft { position: relative; z-index: 1; }
 .path-btn[data-picking] { opacity: 1; pointer-events: none; border-color: var(--ink-4); color: var(--ink-2); }
 .path-btn[data-picking] span { visibility: hidden; }
 .path-btn[data-picking] span::after { content: attr(data-picking); visibility: visible; }
-.paths .fine { margin: 10px 12px 0; }
+.paths .fine { margin: 10px 12px 0; overflow-wrap: anywhere; } /* 长路径是一整个"词",不断行会撑出框外 */
 .paths-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 12px; }
 .movebox { display: inline-flex; align-items: center; gap: 6px; flex: 1 1 100%; font-size: 12.5px; color: var(--ink-2); cursor: pointer; }
 .movebox input { accent-color: var(--cta-bg); width: 15px; height: 15px; flex: none; }
