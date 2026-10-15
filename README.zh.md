@@ -343,6 +343,10 @@ ollama create humanizer -f Modelfile
 | llama.cpp Q8_0，Metal（App 用的就是这个） | 约 36–38 token/s | 百来词的英文邮件约 3.6 秒；300 字左右的中文邮件约 8.5 秒 |
 | MLX 8 bit | 英文约 30 token/s，中文约 38 token/s | 百来词的邮件约 9 秒 |
 
+### 社区贡献：Apple Silicon 上更快的解码
+
+[jayyun98](https://huggingface.co/jayyun98) 为 humanizer 训练了一个投机解码草稿模型：[Humanizer-12B-Draftfit-DSpark](https://huggingface.co/jayyun98/Humanizer-12B-Draftfit-DSpark)。按作者在 M5 Pro + MLX 上的测试，速度约为原来的 1.5 倍（34.5 对 22.8 token/s），输出和单独跑 humanizer 逐 token 一致。它需要和主模型一起运行，安装方法见其模型页。这是社区项目，我们还没有自己测过。
+
 ## 局限
 
 - **细节还可能出错**。英文 420 篇改写里，从严的 LLM 判官在 376 篇里没挑出事实问题；有问题的，9 成以上改一个词或短语就好，比如“37 complaints”（37 条投诉）变成了“37% of complaints”（37% 的投诉）。发出去之前还是请读一遍，重点看数字、日期和人名。

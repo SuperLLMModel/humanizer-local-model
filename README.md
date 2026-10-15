@@ -341,6 +341,10 @@ Measured on an M5 Max:
 | llama.cpp Q8_0, Metal (what the app uses) | about 36–38 tokens/s | an email of about a hundred words: about 3.6 s; a Chinese email of about 300 characters: about 8.5 s |
 | MLX 8-bit | about 30 tokens/s (English), 38 tokens/s (Chinese) | an email of about a hundred words: about 9 s |
 
+### Community: faster decoding on Apple Silicon
+
+[jayyun98](https://huggingface.co/jayyun98) trained a speculative-decoding draft model for humanizer: [Humanizer-12B-Draftfit-DSpark](https://huggingface.co/jayyun98/Humanizer-12B-Draftfit-DSpark). On an M5 Pro with MLX it reports about 1.5× the speed (34.5 vs 22.8 tokens/s), and in their test the output was token-for-token identical to running humanizer alone. It runs alongside the main model and needs the MLX setup described in its model card. This is a community project; we have not benchmarked it ourselves.
+
 ## Limitations
 
 - **It can still change a detail.** A strict LLM judge found no factual problem in 376 of 420 English rewrites; where it found one, more than 9 in 10 fixes are a single word or phrase, such as "37 complaints" becoming "37% of complaints". Read the result before you send it, especially numbers, dates and names.
