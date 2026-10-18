@@ -22,6 +22,10 @@ Same behaviour as the desktop app (0.3.1, 0.3.2):
   not survive is rewritten, up to 3 times, and never shown with a kept passage changed.
 * .docx / PDF import (document.py): the uploaded file is read into the draft box and deleted at once.
 
+Usage log ("usage log" section below): counts per request in raw/, and the submitted draft plus the rewrite in
+text_v1/, scrubbed of e-mails, phone numbers, links and similar details (redact.py), with no visitor identifier.
+The page footer says so; keep the two in step.
+
 HUMANIZER_MOCK=1 runs the page without torch or the model, for local UI work.
 HUMANIZER_MOCK_FAULTS=lang,fact makes the mock's first sample of each part go wrong (Chinese output for an
 English draft; placeholders dropped), to exercise the guards.
@@ -47,7 +51,7 @@ import page
 
 HERE = Path(__file__).resolve().parent
 MODEL_ID = "jialinyyzz/humanizer"
-USAGE_DATASET = "jialinyyzz/humanizer-usage"
+USAGE_DATASET = "jialinyyzz/humanizer-usage"   # private; see "usage log" below
 FINGERPRINT = "cc51d66b4c593fbe"
 MOCK = os.environ.get("HUMANIZER_MOCK") == "1"
 MOCK_FAULTS = set(filter(None, os.environ.get("HUMANIZER_MOCK_FAULTS", "").split(","))) if MOCK else set()
@@ -290,35 +294,115 @@ else:
         yield ("done", {"tokens": n, "eos": True, "gen_seconds": time.time() - t0})
 
 
-# ───────────────────────────────────────────────────────────── usage counter
+# ───────────────────────────────────────────────────────────── usage log
 
-# Counts only. No draft text, no output text, no IP, nothing that identifies a person: people paste
-# text here they would rather not hand around. Needs a write token in the Space secret HF_TOKEN;
-# without one this is a no-op and the app still runs.
+# Two streams in the private dataset USAGE_DATASET, committed every USAGE_EVERY minutes by one CommitScheduler:
+#
+#   raw/<run>.jsonl                      counts per request, as before: lengths, timing, copy rate, outcome, error
+#                                        kind. No text.
+#   text_v1/<YYYY-MM-DD>/<HH>-<run>.jsonl  the submitted draft and the rewrite, to improve the model. Both are scrubbed
+#                                        by redact.py before they touch the disk (e-mail, phone, URL, card, SSN, IP,
+#                                        ID-like strings -> [EMAIL] [PHONE] ...); names are not caught. The time is the
+#                                        UTC hour only. One file per hour, so a finished hour's file is never written again.
+#
+# Never stored, in either stream: IP address, Hugging Face username or login, browser / user agent, or anything else
+# that identifies a visitor. The page footer and README tell visitors what is kept. Writing happens on a background
+# thread, outside the @spaces.GPU functions; a failure is printed and swallowed, never shown to the visitor.
+# Needs a write token in the Space secret HF_TOKEN; without one this is a no-op and the app still runs.
 
-_LOG_DIR = HERE / "usage_log"
-_LOG_FILE = _LOG_DIR / f"{uuid.uuid4().hex}.jsonl"
+import queue  # noqa: E402
+
+import redact  # noqa: E402
+
+USAGE_DATASET = os.environ.get("HUMANIZER_USAGE_DATASET", USAGE_DATASET)
+USAGE_EVERY = float(os.environ.get("HUMANIZER_USAGE_EVERY", "10"))      # minutes between commits
+TEXT_DIR = "text_v1"
+SAMPLING = {"temperature": 1.0, "top_p": 0.95, "top_k": 0, "repetition_penalty": 1.0}  # as in _generate (record only)
+if MOCK:
+    MODEL_REV = "mock"
+else:
+    _m = re.search(r"snapshots/([0-9a-f]{7,40})", hf_hub_download(MODEL_ID, "prompt_format.json"))
+    MODEL_REV = _m.group(1)[:12] if _m else "unknown"
+
+_LOG_DIR = Path(os.environ.get("HUMANIZER_USAGE_DIR") or HERE / "usage_log")
+_RUN = uuid.uuid4().hex
+_RAW_FILE = _LOG_DIR / "raw" / f"{_RUN}.jsonl"
 _scheduler = None
-if os.environ.get("HF_TOKEN") and not MOCK:
+_queue: "queue.Queue" = queue.Queue(maxsize=10000)
+# In the mock, logging runs only when a dataset is named explicitly (local end-to-end tests).
+if os.environ.get("HF_TOKEN") and (not MOCK or os.environ.get("HUMANIZER_USAGE_DATASET")):
     try:
         from huggingface_hub import CommitScheduler
 
-        _LOG_DIR.mkdir(exist_ok=True)
+        (_LOG_DIR / "raw").mkdir(parents=True, exist_ok=True)
+        (_LOG_DIR / TEXT_DIR).mkdir(parents=True, exist_ok=True)
         _scheduler = CommitScheduler(repo_id=USAGE_DATASET, repo_type="dataset", folder_path=_LOG_DIR,
-                                     path_in_repo="raw", every=10, private=True)
-    except Exception as exc:  # never let telemetry break the demo
+                                     every=USAGE_EVERY, private=True,
+                                     allow_patterns=["raw/*.jsonl", f"{TEXT_DIR}/*.jsonl"])
+    except Exception as exc:  # never let logging break the demo
+        _scheduler = None
         print(f"[usage] disabled: {exc}", flush=True)
 
 
-def log_use(**row):
+def _text_row(t: float, f: dict) -> dict:
+    """A text_v1 record: the hour (UTC), scrubbed draft and rewrite, settings, lengths, language, model."""
+    draft, out = f.pop("input", "") or "", f.pop("output", "") or ""
+    s_in, pii_in = redact.redact(draft)
+    s_out, pii_out = redact.redact(out)
+    pii = {k: pii_in.get(k, 0) + pii_out.get(k, 0) for k in set(pii_in) | set(pii_out)}
+    cjk = hz_text.is_cjk(draft) if draft else False
+    return {"hour": time.strftime("%Y-%m-%dT%H:00Z", time.gmtime(t)),
+            "event": f.pop("event", "submit"), "mode": f.pop("mode", "web"),
+            "lang": f.pop("lang", None) or ("zh" if cjk else "en"),
+            "model": MODEL_ID, "model_rev": MODEL_REV,
+            "params": {**SAMPLING, **f.pop("params", {})},
+            "unit": "chars" if cjk else "words",
+            "input_len": hz_text.count_words(draft), "output_len": hz_text.count_words(out),
+            "input": s_in, "output": s_out, "redacted": pii, **f}
+
+
+def _writer():
+    while True:
+        kind, t, row = _queue.get()
+        try:
+            if kind == "raw":
+                path, line = _RAW_FILE, row
+            else:
+                g = time.gmtime(t)
+                path = _LOG_DIR / TEXT_DIR / time.strftime("%Y-%m-%d", g) / f"{time.strftime('%H', g)}-{_RUN}.jsonl"
+                line = _text_row(t, row)
+            data = json.dumps(line, ensure_ascii=False) + "\n"
+            with _scheduler.lock:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with path.open("a", encoding="utf-8") as fh:
+                    fh.write(data)
+        except Exception as exc:
+            print(f"[usage] write failed ({kind}): {type(exc).__name__}: {exc}", flush=True)
+        finally:
+            _queue.task_done()
+
+
+if _scheduler is not None:
+    threading.Thread(target=_writer, name="usage-writer", daemon=True).start()
+
+
+def _enqueue(kind: str, row: dict):
     if _scheduler is None:
         return
     try:
-        row = {"ts": int(time.time()), "model": "12b", **row}
-        with _scheduler.lock, _LOG_FILE.open("a") as fh:
-            fh.write(json.dumps(row) + "\n")
-    except Exception as exc:
-        print(f"[usage] write failed: {exc}", flush=True)
+        _queue.put_nowait((kind, time.time(), row))
+    except Exception as exc:  # queue full or anything else: drop the row, never the request
+        print(f"[usage] dropped a {kind} row: {type(exc).__name__}", flush=True)
+
+
+def log_use(**row):
+    """Counts only (raw/), unchanged from before."""
+    _enqueue("raw", {"ts": int(time.time()), "model": "12b", **row})
+
+
+def log_text(**row):
+    """The draft and the rewrite (text_v1/), scrubbed on the writer thread before they are written."""
+    _enqueue("text", row)
 
 
 # ───────────────────────────────────────────────────────────── output panel
@@ -467,8 +551,25 @@ def _check_input(draft: str):
     return n_tok, None
 
 
+_GPU_HINTS = {
+    "runs_limit": ("Hugging Face's free GPU runs for visitors without an account are used up for now. Log in to Hugging Face (free) for more, come back later, or run the model on your own computer (see below).",
+                   "没登录的访客，Hugging Face 免费 GPU 次数暂时用完了。登录 Hugging Face（免费）可以多拿一些、过一会儿再试，或者装到自己电脑上跑（见下方）。"),
+    "quota": ("Your free GPU time on Hugging Face is used up for now. Log in to Hugging Face for more, come back later, or run the model on your own computer (see below).",
+              "你在 Hugging Face 的免费 GPU 时长暂时用完了。登录 Hugging Face 可以多拿一些、过一会儿再试，或者装到自己电脑上跑（见下方）。"),
+    "no_gpu": ("No GPU is free right now: Hugging Face's shared GPUs are all busy. Wait a minute and press the arrow again.",
+               "现在没有空闲的 GPU：Hugging Face 的共享 GPU 都在忙。等一分钟再点一次箭头。"),
+    "duration": ("This draft needs a longer GPU slot than Hugging Face allows you right now. Log in to Hugging Face, paste a shorter draft, or run the model on your own computer (see below).",
+                 "这篇稿子需要的 GPU 时长超过了 Hugging Face 现在给你的上限。登录 Hugging Face、贴短一点的稿子，或者装到自己电脑上跑（见下方）。"),
+}
+
+
 def _gpu_error(msg: str):
-    return ("warn" if "quota" in msg.lower() else "err",
+    kind = _err_kind(msg)
+    if kind in _GPU_HINTS:
+        en, zh = _GPU_HINTS[kind]
+        return ("warn", f"{en}<br><span class=\"dim\">({html.escape(_err_msg(msg))})</span>",
+                f"{zh}<br><span class=\"dim\">（{html.escape(_err_msg(msg))}）</span>")
+    return ("err",
             f"The GPU call failed: {html.escape(msg)}<br>If it says you are out of free GPU time, log in to Hugging Face, come back later, or run the model on your own computer (see below).",
             f"GPU 调用失败：{html.escape(msg)}<br>如果提示免费 GPU 时长用完，可以登录 Hugging Face、过一会儿再试，或者装到自己电脑上跑（见下方）。")
 
@@ -506,7 +607,29 @@ def _parts(draft: str):
 
 def _err_kind(msg: str) -> str:
     m = msg.lower()
-    return "quota" if "quota" in m else "timeout" if ("timeout" in m or "time limit" in m or "aborted" in m) else "other"
+    if "runs limit" in m:
+        return "runs_limit"            # ZeroGPU: a visitor without an account used up their runs
+    if "quota" in m or "gpu limit" in m:
+        return "quota"
+    if "maximum allowed" in m:
+        return "duration"              # ZeroGPU: requested slot longer than this visitor may ask for
+    if "no gpu was available" in m:
+        return "no_gpu"
+    if "timeout" in m or "time limit" in m or "aborted" in m:
+        return "timeout"
+    return "other"
+
+
+def _err_msg(msg: str) -> str:
+    """The error text for the usage log: ZeroGPU / runtime messages only (never the visitor's text), tags
+    stripped, cut to 120 characters."""
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", msg or "")).strip()[:120]
+
+
+def _log_gpu_error(msg: str) -> str:
+    kind = _err_kind(msg)
+    print(f"[gpu-error] {kind}: {_err_msg(msg)}", flush=True)
+    return kind
 
 
 def _fact_retry_note(n: int):
@@ -514,28 +637,47 @@ def _fact_retry_note(n: int):
             f"保留的文字被改动了，重新改写（第 {n}/{factlib.FACT_TRIES} 次）……")
 
 
+def _facts_and_event(facts_raw):
+    """facts_raw is the kept passages as a JSON list (older pages, API callers) or, from the current page,
+    {"facts": [...], "event": "submit" | "regenerate"}. Two inputs either way, so an open tab from before an update
+    and old API calls keep working."""
+    event = "submit"
+    try:
+        obj = json.loads(facts_raw) if isinstance(facts_raw, str) and facts_raw.strip() else facts_raw
+    except ValueError:
+        obj = facts_raw
+    if isinstance(obj, dict):
+        event = obj.get("event") if obj.get("event") in ("submit", "regenerate") else "submit"
+        obj = obj.get("facts", [])
+    return factlib.parse(obj if isinstance(obj, list) else []), event
+
+
 def rewrite(draft: str, facts_raw: str = "[]"):
     """Never hand back nothing when something was written: parts that finished (and the half of a part the GPU
     stopped in, unless it holds a kept passage) stay on screen with a notice saying what is missing.
     Per part: an empty sample gets one automatic retry; a sample in the wrong language is resampled up to
-    hz_text.LANG_RETRIES times; a sample that lost a kept passage is rewritten, up to factlib.FACT_TRIES tries."""
+    hz_text.LANG_RETRIES times; a sample that lost a kept passage is rewritten, up to factlib.FACT_TRIES tries.
+    facts_raw may also carry the usage-log event: "regenerate" when the page sends the same draft again (go.click js)."""
+    facts_list, event = _facts_and_event(facts_raw)
     draft = (draft or "").strip()
     if not draft:
         yield panel_message("warn", "Paste a draft first.", "先贴一篇草稿。")
         return
     cjk = hz_text.is_cjk(draft)
-    prot = factlib.protect(draft, factlib.parse(facts_raw))   # kept passages -> placeholders, on the whole draft
+    prot = factlib.protect(draft, facts_list)   # kept passages -> placeholders, on the whole draft
     parts = _parts(prot.text)
     todo, left = parts[:PARTS], parts[PARTS:]
     yield panel_wait()
     t0, done_out, done_draft = time.time(), "", ""
     toks, gsec, eos_all, stop, retries = 0, 0.0, True, None, 0
     lang_resampled, lang_kept_wrong, fact_tries_extra = 0, 0, 0
+    run_params = {"max_new_tokens": [], "facts": len(prot.locks), "parts": len(parts), "fast": None}
     for i, (part, sep) in enumerate(todo):
         orig = factlib.restore_loose(part, prot)         # this part as the visitor wrote it
         locks = prot.indices_in(part)
         n_tok = count_tokens(part)
         max_new, budget, _ = plan(n_tok)
+        run_params["max_new_tokens"].append(max_new)
         english = hz_text.han_chars(orig) <= 2
         empty_left, lang_left, fact_left = 1, hz_text.LANG_RETRIES, factlib.FACT_TRIES - 1
         note, out, info, err = None, "", None, None
@@ -588,6 +730,8 @@ def rewrite(draft: str, facts_raw: str = "[]"):
                     break
             out = shown
             break
+        if info and run_params["fast"] is None and "fast" in info:
+            run_params["fast"] = info["fast"]
         if out:
             done_out += out + (sep if not err else "")
             done_draft += orig + (sep if not err else "")
@@ -603,17 +747,24 @@ def rewrite(draft: str, facts_raw: str = "[]"):
                 done_parts=(stop[0] if stop else len(todo)), retries=retries, seconds=round(wall, 1),
                 facts=len(prot.locks), fact_retries=fact_tries_extra, lang_resampled=lang_resampled)
     facts_failed = bool(stop and stop[1] == "facts")
+
+    def record(outcome: str):
+        log_text(event=event, mode="web", input=draft, output=out_all, outcome=outcome, lang="zh" if cjk else "en",
+                 params=run_params)
     if not out_all:
         if facts_failed:
             log_use(outcome="facts_failed", **base)
+            record("facts_failed")
             yield panel_message("warn",
                                 f"After {factlib.FACT_TRIES} tries the rewrite still didn't keep every fact word for word, so it wasn't used. Press the arrow to try again, or keep fewer or shorter facts.",
                                 f"连试 {factlib.FACT_TRIES} 次，改写都没能把「原样保留」的文字一字不差地带过来，这次结果没有采用。再点一次箭头重试，或者少保留几段、保留得短一点。")
         elif stop and stop[1] != "empty sample twice":
-            log_use(outcome="error", err=_err_kind(stop[1]), **base)
+            log_use(outcome="error", err=_log_gpu_error(stop[1]), err_msg=_err_msg(stop[1]), **base)
+            record("error")
             yield panel_message(*_gpu_error(stop[1]))
         else:
             log_use(outcome="empty", **base)
+            record("empty")
             yield panel_message("warn", "Two samples in a row came back empty. Press the arrow again.",
                                 "连续两发都是空的，请再点一次箭头。")
         return
@@ -648,7 +799,9 @@ def rewrite(draft: str, facts_raw: str = "[]"):
                       f"保留的文字头一次被改动了，已自动重写（共 {fact_tries_extra + 1} 次）。"))
     log_use(outcome="ok" if not (stop or left) else "partial", lang="zh" if cjk else "en", out_tokens=toks,
             eos=eos_all, copy=round(hz_text.copy_rate(drafted, out_all), 3), gen_seconds=round(gsec, 1),
-            err=(None if not stop else "facts" if facts_failed else _err_kind(stop[1])), left_parts=len(left), **base)
+            err=(None if not stop else "facts" if facts_failed else _log_gpu_error(stop[1])),
+            err_msg=(None if not stop or facts_failed else _err_msg(stop[1])), left_parts=len(left), **base)
+    record("ok" if not (stop or left) else "partial")
     yield panel_done(drafted, out_all, {"tokens": toks, "eos": eos_all, "gen_seconds": gsec}, wall, cjk, extra)
 
 
@@ -659,31 +812,43 @@ def humanize(draft: str) -> dict:
     "gen_seconds", "language_resampled"}.
     Up to about 700 English words or 1,200 Chinese characters per call. A rewrite in the wrong language
     (an English draft written in Chinese) is sampled again, up to 3 times. Proofread the result.
+    To improve the model, the draft and the rewrite are stored anonymously, with emails, phone numbers, links and
+    similar details removed automatically (see the privacy note at the bottom of the Space page).
     """
-    draft = (draft or "").strip()
+    if isinstance(draft, dict):          # some API clients send {"text": ...} instead of a string
+        draft = draft.get("text") or draft.get("draft") or draft.get("value") or ""
+    draft = str(draft or "").strip()
     n_tok, msg = _check_input(draft)
     if msg:
         raise gr.Error(re.sub(r"<[^>]+>", "", msg[0]))
     max_new, budget, _ = plan(n_tok)
     english = hz_text.han_chars(draft) <= 2
     t0, resampled = time.time(), 0
-    while True:
-        text, info, drifted = "", {}, False
-        last = resampled >= hz_text.LANG_RETRIES
-        for kind, val in _generate(build_prompt(draft), max_new, budget, english and not last):
-            if kind == "text":
-                text += val
-            elif kind == "drift":
-                drifted = True
-            elif kind == "done":
-                info = val
-            elif kind == "error":
-                raise gr.Error(val)
-        if not last and (drifted or hz_text.language_drift(draft, text.strip())):
-            resampled += 1
-            continue
-        break
+    api_params = {"max_new_tokens": [max_new], "facts": 0, "parts": 1, "fast": None}
+    try:
+        while True:
+            text, info, drifted = "", {}, False
+            last = resampled >= hz_text.LANG_RETRIES
+            for kind, val in _generate(build_prompt(draft), max_new, budget, english and not last):
+                if kind == "text":
+                    text += val
+                elif kind == "drift":
+                    drifted = True
+                elif kind == "done":
+                    info = val
+                elif kind == "error":
+                    raise gr.Error(val)
+            if not last and (drifted or hz_text.language_drift(draft, text.strip())):
+                resampled += 1
+                continue
+            break
+    except Exception:
+        log_text(event="api", mode="api", input=draft, output="", outcome="api_error", params=api_params)
+        raise
     out = text.strip()
+    api_params["fast"] = info.get("fast")
+    log_text(event="api", mode="api", input=draft, output=out, outcome="api_ok" if out else "api_empty",
+             params=api_params)
     chk = hz_text.check(draft, out, truncated=not info.get("eos", True))
     log_use(outcome="api_ok" if out else "api_empty", in_units=hz_text.count_words(draft), in_tokens=n_tok,
             out_tokens=info.get("tokens"), eos=info.get("eos"), copy=chk.copy, seconds=round(time.time() - t0, 1),
@@ -722,7 +887,8 @@ def _toast(kind: str, en: str, zh: str) -> str:
 
 def import_document(path):
     """An uploaded .docx / .pdf -> its text in the draft box. The file is deleted as soon as it is read;
-    only counts are logged (file type, size bucket, characters), never the name or the text."""
+    only counts are logged here (file type, characters), never the name or the text. The text is logged (scrubbed)
+    only if the visitor then submits it for a rewrite, like any other draft."""
     path = path if isinstance(path, str) else getattr(path, "name", None)
     if not path:
         return gr.skip(), "", None
@@ -841,9 +1007,13 @@ with gr.Blocks(title="humanizer: rewrite AI drafts so they read like a person wr
     gr.HTML(page.examples_section(EXAMPLES) + page.local_section() + page.results_section()
             + page.limits_section() + page.footer(), elem_id="hz-body", padding=False, apply_default_css=False)
 
+    # Still two inputs (an open tab from before an update sends two): the js folds the usage-log event, "regenerate"
+    # when the same draft is sent again, into the facts value as {"facts": [...], "event": ...}.
     go.click(rewrite, inputs=[draft_box, facts_box], outputs=out_html, show_progress="hidden", concurrency_limit=2,
              api_visibility="undocumented",
-             js="(d, f) => { document.documentElement.classList.add('hz-busy'); return [d, window.HZ ? window.HZ.factsJSON() : '[]']; }") \
+             js="(d, f) => { document.documentElement.classList.add('hz-busy');"
+                " const ev = (window.__hzLastDraft === d) ? 'regenerate' : 'submit'; window.__hzLastDraft = d;"
+                " return [d, JSON.stringify({facts: JSON.parse(window.HZ ? window.HZ.factsJSON() : '[]'), event: ev})]; }") \
       .then(None, js="() => { document.documentElement.classList.remove('hz-busy'); }")
     doc_upload.upload(import_document, inputs=doc_upload, outputs=[draft_box, toast, doc_upload], show_progress="hidden",
                       concurrency_limit=4, api_visibility="private") \

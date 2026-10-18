@@ -47,8 +47,15 @@ especially numbers, dates, names (and the direction of every claim).
 **API:** `gradio_client` → `Client("jialinyyzz/humanizer").predict(draft, api_name="/humanize")` returns
 the rewrite plus copy rate and any numbers missing from it.
 
-**Privacy:** the Space keeps no text. It logs counts only (lengths, timing, copy rate), never the draft,
-the output or your IP. An imported file is deleted as soon as its text has been read.
+**Privacy:** to improve the model, the Space stores submitted text and the rewrites anonymously, in a private
+dataset that is not published or shared with third parties. Before anything is saved, emails, phone numbers, links,
+card numbers, US Social Security numbers, IP addresses and account or ID numbers are replaced with placeholders such
+as `[EMAIL]` or `[PHONE]`. This is automatic pattern matching: names and details written out in words are not caught,
+so don't paste anything you would not want stored. Each record holds the draft, the rewrite, the hour (UTC), the
+settings, lengths, language, model version and whether it was a re-run; never your IP address, Hugging Face account
+or browser details. Imported files are deleted as soon as their text is read. To have your text removed, open a
+thread in the [Community tab](https://huggingface.co/spaces/jialinyyzz/humanizer/discussions) with the approximate
+date and a short phrase from it. To keep text off our servers entirely, run the model locally (above).
 
 Source of this Space: [`space/`](https://github.com/sgaofen/humanizer-local-model/tree/main/space) in the GitHub repo.
 
@@ -57,3 +64,5 @@ Source of this Space: [`space/`](https://github.com/sgaofen/humanizer-local-mode
 把 AI 写的草稿改成读起来像人写的，训练目标是数字、单位、日期、人名、引语原样保留。中英文都行。训练全程没有用任何 AI 检测器。
 这里可以在线试一篇，也可以导入 .docx 或 PDF（最大 10 MB，读完即删）；在草稿里选中一段文字点「原样保留」，改写时这段一字不改。想装到自己电脑上，下载 [App（macOS / Windows）](https://github.com/sgaofen/humanizer-local-model/releases/latest)，
 或者看 [不用 App 怎么用](https://github.com/sgaofen/humanizer-local-model/blob/main/docs/USAGE.zh.md)。
+
+隐私：为改进模型，我们会匿名保存提交的文字和生成结果。保存前会自动去除邮箱、电话、链接等个人信息（规则匹配，认不出人名），数据仅用于改进模型，存放在私有数据集里，不会公开或分享给第三方；不记录 IP、账号或浏览器信息。想删除自己的文字，请在 [Community 讨论区](https://huggingface.co/spaces/jialinyyzz/humanizer/discussions) 发帖，写明大概日期和文中一小段话。

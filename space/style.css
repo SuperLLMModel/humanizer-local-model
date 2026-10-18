@@ -357,6 +357,11 @@ html[data-lang="zh"] .sec-title { letter-spacing: -.01em; }
 
 .foot { margin: 72px 0 24px; padding-top: 22px; border-top: 1px solid var(--line); font-size: 12.5px; color: var(--ink-3); }
 .foot p { margin: 0 0 8px !important; max-width: 90ch; line-height: 1.6; }
+.foot .foot-data { color: var(--ink-2); }
+.foot-privacy { margin: 0 0 14px; max-width: 90ch; }
+.foot-privacy summary { cursor: pointer; color: var(--ink-2); width: fit-content; }
+.foot-privacy ul { margin: 8px 0 0; padding-left: 18px; line-height: 1.6; }
+.foot-privacy li { margin: 0 0 6px; }
 
 /* ───────── import, Create fact, toasts (the app's 0.3.2 parts, same look) ───────── */
 #draft-long[hidden], #facts-panel[hidden], #btn-create-fact[hidden], #dropzone[hidden], .draft-overlays[hidden], .toast.gone { display: none !important; }

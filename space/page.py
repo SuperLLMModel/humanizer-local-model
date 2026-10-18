@@ -168,13 +168,12 @@ def editor_note() -> str:
         f"characters is split at paragraph breaks and rewritten part by part. Free GPU time per visitor is limited, "
         f"so the first run can wait in a queue. For long documents use the app or <code>hz</code> "
         f"(<a href=\"#local\">below</a>). Import a .docx or PDF (up to {UPLOAD_MB} MB), or select text in the draft and click "
-        f"<b>Create fact</b> to keep it word for word. Your text is not stored: imported files are deleted as soon as "
-        f"they are read, and this page logs counts and timing only.",
+        f"<b>Create fact</b> to keep it word for word. Imported files are deleted as soon as their text is read.",
         f"这里跑的是完整的 bf16 模型，用 Hugging Face 的共享 GPU（ZeroGPU）。每次最多英文约 {MAX_WORDS * PARTS:,} 词、"
         f"中文约 {MAX_CJK * PARTS:,} 字；超过英文 {MAX_WORDS} 词或中文 {MAX_CJK:,} 字的，会在段落之间切开、一段一段改。"
         f"每位访客的免费 GPU 时长有限，第一次可能要排队。长文档请用 App 或 "
         f"<code>hz</code>（见<a href=\"#local\">下方</a>）。可以导入 .docx 或 PDF（最大 {UPLOAD_MB} MB）；在草稿里选中一段文字点"
-        f"<b>「原样保留」</b>，改写时这段一字不改。不保存你的文字：导入的文件读完立刻删除，只记录字数和耗时。",
+        f"<b>「原样保留」</b>，改写时这段一字不改。导入的文件读出文字后立刻删除。",
         "editor-note")
 
 
@@ -379,8 +378,53 @@ def limits_section() -> str:
 </section>"""
 
 
+COMMUNITY = "https://huggingface.co/spaces/jialinyyzz/humanizer/discussions"
+
+
+def privacy_note() -> str:
+    """The data notice at the very bottom of the page, plus a folded privacy note. Keep it in step with the
+    "usage log" section of app.py and the Privacy paragraph of README.md. Never promise that everything personal
+    is removed: the scrubbing is pattern-based and does not catch names."""
+    notice = P("To improve the model, we store submitted text and the rewrites anonymously. Emails, phone numbers, links "
+               "and similar personal details are removed automatically before anything is saved. The data is used only "
+               "to improve the model and is not made public or shared with third parties.",
+               "为改进模型，我们会匿名保存提交的文字和生成结果。保存前会自动去除邮箱、电话、链接等个人信息，"
+               "数据仅用于改进模型，不会公开或分享给第三方。", "foot-data")
+    items = [
+        ("<b>What is saved:</b> the draft you submit and the rewrite, the hour (UTC) of the request, the settings used "
+         "(sampling temperature and so on), lengths, language, model version, and whether it was a first run or a re-run "
+         "of the same draft. The same applies to calls through the API.",
+         "<b>保存什么：</b>你提交的草稿和改写结果、请求所在的小时（UTC）、所用设置（采样温度等）、字数、语言、模型版本，"
+         "以及这是第一次改写还是同一篇重新生成。通过 API 调用的也一样。"),
+        ("<b>What is not saved:</b> your IP address, Hugging Face account or username, browser details, or anything else "
+         "that identifies you. Imported files are deleted as soon as their text is read; that text is saved only if you "
+         "submit it for a rewrite.",
+         "<b>不保存什么：</b>IP 地址、Hugging Face 账号或用户名、浏览器信息，以及其他能认出你是谁的信息。"
+         "导入的文件读出文字后立刻删除；这些文字只有在你点了改写之后才会和其他草稿一样被保存。"),
+        ("<b>How personal details are removed:</b> before saving, emails, phone numbers, links, card numbers, US Social "
+         "Security numbers, IP addresses and account or ID numbers are replaced with placeholders such as [EMAIL] or "
+         "[PHONE]. This is automatic pattern matching: names, street addresses and details written out in words are not "
+         "caught, so please don't paste anything you would not want stored.",
+         "<b>怎么去除个人信息：</b>保存前，邮箱、电话、链接、银行卡号、美国社安号、IP 地址、账号或证件号会被替换成 [EMAIL]、"
+         "[PHONE] 这样的占位符。这是自动的规则匹配，认不出人名、地址和用文字写出来的信息，所以不想被保存的内容请不要贴进来。"),
+        ("<b>What it is used for:</b> training and evaluating future versions of this model. It is kept in a private "
+         "dataset on Hugging Face, not published, and not shared with third parties.",
+         "<b>用来做什么：</b>训练和评测这个模型的后续版本。数据存放在 Hugging Face 上的私有数据集里，不公开，"
+         "也不分享给第三方。"),
+        (f"<b>Deleting your text:</b> open a thread in the Space's {A(COMMUNITY, 'Community tab')} with the approximate "
+         f"date and a short phrase from the text (not the personal details themselves), and we will remove the matching "
+         f"records. To keep text off our servers entirely, run the model on your own computer (see above).",
+         f"<b>申请删除：</b>在本 Space 的 {A(COMMUNITY, 'Community 讨论区')} 发一个帖子，写明大概日期和文中的一小段话"
+         f"（不要贴个人信息本身），我们会删掉对应的记录。如果完全不想让文字经过我们的服务器，可以把模型装到自己电脑上跑（见上方）。"),
+    ]
+    lis = "".join(f"<li>{P(en, zh, tag='span')}</li>" for en, zh in items)
+    return f"""{notice}
+  <details class="foot-privacy"><summary>{L("Privacy details", "隐私说明")}</summary><ul>{lis}</ul></details>"""
+
+
 def footer() -> str:
     return f"""<footer class="foot">
+  {privacy_note()}
   {P(f"Code and weights: Apache 2.0. Fine-tuned from {A('https://huggingface.co/google/gemma-4-12B', 'google/gemma-4-12B')} (Apache 2.0); this project is not affiliated with or endorsed by Google. "
      f"",
      f"代码和权重：Apache 2.0。由 {A('https://huggingface.co/google/gemma-4-12B', 'google/gemma-4-12B')} 微调而来（Apache 2.0），本项目与 Google 无隶属或背书关系。"
