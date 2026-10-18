@@ -12,14 +12,16 @@ export function loadHistory() {
 }
 
 function save(list) {
-  for (let n = list.length; n > 0; n = Math.floor(n / 2)) {
+  let n = list.length;
+  do {
     try {
       localStorage.setItem(KEY, JSON.stringify(list.slice(0, n)));
       return;
     } catch {
       // 配额满了:丢掉老的一半再试
     }
-  }
+    n = Math.floor(n / 2);
+  } while (n > 0);
 }
 
 export function addHistory(entry) {

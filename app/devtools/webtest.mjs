@@ -1,6 +1,6 @@
 import { getJSON, postJSON, countTokens } from '../web/js/api.js';
 import { planDocument, needsSections, newDocumentJob, documentSignature, readDocumentJob, jobMatches, jobDone, combinedDocument, runDocumentSections, SECTION_MAX } from '../web/js/document.js';
-import { store, addHistory, loadHistory, clearHistory } from '../web/js/history.js';
+import { store, addHistory, loadHistory, removeHistory, clearHistory } from '../web/js/history.js';
 // 网页纯逻辑的单测(不需要浏览器):node devtools/webtest.mjs 或 bun devtools/webtest.mjs
 import { activeFacts, protectFacts, restoreFacts, streamView, withFactGuard, FACT_TRIES } from '../web/js/facts.js';
 import { createHash } from 'node:crypto';
@@ -324,7 +324,43 @@ for (const s of fx.samples) {
   ok(pd0.facts.length===1 && pd0.text.includes('[[HZ_LOCK_0]]') && !pd0.text.includes(fact), '每段只保护本段里出现的保留文字');
 }
 
-// 13. localStorage 不可用(无痕 / 被禁用 / 抛异常):存取都不崩,断点读出来是 null
+// 13. 历史记录:删到空时写回空数组;非空记录超配额时仍丢掉老的一半
+{
+  const desc = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+  const values = new Map();
+  let maxHistory = Infinity;
+  const storage = {
+    getItem(k) { return values.has(k) ? values.get(k) : null; },
+    setItem(k, v) {
+      if (k === 'hz.history.v1' && JSON.parse(v).length > maxHistory) throw new Error('QuotaExceededError');
+      values.set(k, String(v));
+    },
+    removeItem(k) { values.delete(k); },
+  };
+  Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: storage });
+  try {
+    addHistory({ id: 'only' });
+    removeHistory('only');
+    ok(loadHistory().length === 0 && values.get('hz.history.v1') === '[]', '删除唯一一条历史后写回空数组');
+
+    clearHistory();
+    addHistory({ id: 'first' });
+    addHistory({ id: 'second' });
+    removeHistory('second');
+    removeHistory('first');
+    ok(loadHistory().length === 0 && values.get('hz.history.v1') === '[]', '多条历史逐条删除时最后一条也能删掉');
+
+    clearHistory();
+    for (const id of ['first', 'second', 'third', 'fourth']) addHistory({ id });
+    maxHistory = 2;
+    addHistory({ id: 'fifth' });
+    ok(loadHistory().map((x) => x.id).join() === 'fifth,fourth', '历史超配额时保留较新的一半');
+  } finally {
+    if (desc) Object.defineProperty(globalThis, 'localStorage', desc); else delete globalThis.localStorage;
+  }
+}
+
+// localStorage 不可用(无痕 / 被禁用 / 抛异常):存取都不崩,断点读出来是 null
 {
   const desc = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
   Object.defineProperty(globalThis, 'localStorage', { configurable: true, get() { throw new Error('SecurityError'); } });
