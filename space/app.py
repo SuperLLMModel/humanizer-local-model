@@ -27,14 +27,15 @@ text_v1/, scrubbed of e-mails, phone numbers, links and similar details (redact.
 The page footer says so; keep the two in step.
 
 HUMANIZER_MOCK=1 runs the page without torch or the model, for local UI work.
-HUMANIZER_MOCK_FAULTS=lang,fact makes the mock's first sample of each part go wrong (Chinese output for an
-English draft; placeholders dropped), to exercise the guards.
+HUMANIZER_MOCK_FAULTS=lang,fact,cut makes the mock's first sample of each part go wrong (Chinese output for an
+English draft; placeholders dropped; stopped halfway as if max_time ran out), to exercise the guards and notices.
 """
 from __future__ import annotations
 
 import hashlib
 import html
 import json
+import math
 import os
 import re
 import threading
@@ -58,9 +59,27 @@ MOCK_FAULTS = set(filter(None, os.environ.get("HUMANIZER_MOCK_FAULTS", "").split
 
 MAX_WORDS, MAX_CJK, PARTS = page.MAX_WORDS, page.MAX_CJK, page.PARTS
 MAX_DRAFT_TOKENS = 1400      # backstop behind the word / character cap
-TPS_EST = 16.0               # decode speed used to size the GPU slot (measured 17.3-17.5 tok/s on ZeroGPU, bf16)
-SLOT_MIN, SLOT_MAX = 30, 120  # seconds requested from ZeroGPU
-SLOT_OVERHEAD = 12           # GPU hand-over and prefill (measured about 2.5 s) plus margin
+# GPU slot sizing (plan() below). ZeroGPU admits a call by the seconds it *requests* ("quota (138s requested vs.
+# 127s left)"), so asking for far more than a rewrite uses turns visitors away. Measured on the usage log (raw counts):
+#   * plain transformers generate (12B before the AOTI step, 10-02..10-10, 374 outputs of 200+ tokens):
+#     median 17.3 tok/s, p5 15.8, p1 13.9 (a busy shared GPU can be slower still)
+#   * AOTI decode step (fastgen.py, 10-10..10-19, 906 outputs of 200+ tokens): median 24.8 tok/s, p1 23.3
+#   * output / draft tokens (drafts of 50+ tokens): median 1.05, p99 1.39
+#   * time in the GPU call outside generation: AOTI load 0.1-0.6 s in a new worker, tokenizing, wind-down
+# Which path a call takes is decided inside the GPU worker (_fast_engine: a worker whose AOTI load fails falls back
+# to plain generate), after the slot has been requested, so the main process cannot know it in advance. The slot
+# is therefore sized at the plain-generate speed, never the AOTI speed: a worker that falls back still finishes a
+# p99-length rewrite before max_time instead of being cut off; on the AOTI path the call simply ends early, and
+# ZeroGPU only charges the seconds actually used. (Sizing at 22 tok/s would cut a fallback worker's rewrite off at
+# about 0.7x of the expected length, i.e. at the median length.) Replay on the log
+# (humantune experiments/writer_direction/space_usage/replay_slot.py): 0 of 2,685 single-part rewrites would have
+# been cut (AOTI and plain-generate history alike, and the AOTI history re-timed at 17.2 tok/s), nor any of 192
+# multi-part ones; requested seconds per call: mean 46 -> 39, median 38 -> 31, p90 78 -> 70.
+TPS_SIZE = 15.0              # tok/s the slot is sized at: plain generate, below its p5 (15.8)
+SLOT_MIN, SLOT_MAX = 22, 120  # seconds requested from ZeroGPU; the floor still covers max_new's floor (256) at 16 tok/s
+SLOT_OVERHEAD = 6            # slot minus max_time: GPU hand-over and wind-down (wall minus gen time: p50 2.7 s, p90 4.3 s);
+#                              max_time counts from the start of the GPU call (_generate), so an AOTI load or any other
+#                              work in the worker before the first token comes out of the budget, not out of this
 
 # ───────────────────────────────────────────────────────────── prompt
 
@@ -177,11 +196,13 @@ else:
 
 
 def plan(n_tok: int):
-    """(max_new_tokens, max_time seconds, ZeroGPU slot seconds) for a draft of n_tok tokens."""
+    """(max_new_tokens, max_time seconds, ZeroGPU slot seconds) for a draft of n_tok tokens.
+    Sized for the slow path (plain generate), see TPS_SIZE; max_new_tokens is the app's rule, unchanged."""
     max_new = max(256, min(2048, round(2.5 * n_tok)))
-    expected = 1.5 * n_tok + 64                       # a rewrite is about as long as its draft
-    budget = min(SLOT_MAX - SLOT_OVERHEAD, max(SLOT_MIN - SLOT_OVERHEAD, 6 + expected / TPS_EST))
-    return max_new, round(budget, 1), int(budget + SLOT_OVERHEAD)
+    expected = 1.35 * n_tok + 48                      # p99 of output / draft tokens is 1.39 (drafts of 50+ tokens)
+    budget = min(SLOT_MAX - SLOT_OVERHEAD, max(SLOT_MIN - SLOT_OVERHEAD, 6 + expected / TPS_SIZE))
+    budget = round(budget, 1)
+    return max_new, budget, math.ceil(budget + SLOT_OVERHEAD - 1e-9)   # slot >= max_time + SLOT_OVERHEAD, always
 
 
 if not MOCK:
@@ -195,12 +216,15 @@ if not MOCK:
             return torch.full((input_ids.shape[0],), self.flag.is_set(), dtype=torch.bool, device=input_ids.device)
 
     def _slot(prompt: str, max_new: int, budget: float, en_guard: bool = False) -> int:
-        return int(budget + SLOT_OVERHEAD)
+        return math.ceil(budget + SLOT_OVERHEAD - 1e-9)                        # = plan()[2]
 
     @spaces.GPU(duration=_slot)
     def _generate(prompt: str, max_new: int, budget: float, en_guard: bool = False):
         """Streams ("text", piece) ... then ("done", info). en_guard: the draft is English, so stop and
-        yield ("drift", None) once the rewrite has more than a few Chinese characters."""
+        yield ("drift", None) once the rewrite has more than a few Chinese characters.
+        max_time counts from here, the start of the GPU call: work before the first token (tokenizing, loading the
+        AOTI step in a new worker, a failed load) comes out of `budget`, so the call stays inside its slot."""
+        t_call = time.time()
         enc = tokenizer(prompt, return_tensors="pt").to(model.device)
         streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True,
                                         timeout=budget + 30)
@@ -208,9 +232,12 @@ if not MOCK:
         n_prompt = enc["input_ids"].shape[1]
         fast = _fast_engine(n_prompt, max_new)
 
+        def time_left() -> float:                     # max_time for a generation starting now
+            return max(1.0, budget - (time.time() - t_call))
+
         def plain():
             ids = model.generate(
-                **enc, streamer=streamer, max_new_tokens=max_new, max_time=budget,
+                **enc, streamer=streamer, max_new_tokens=max_new, max_time=time_left(),
                 do_sample=True, temperature=1.0, top_p=0.95, top_k=0, repetition_penalty=1.0,
                 pad_token_id=tokenizer.pad_token_id, eos_token_id=EOS,
                 stopping_criteria=StoppingCriteriaList([_StopWhenSet(flag)]))
@@ -231,12 +258,13 @@ if not MOCK:
                         streamer.put(torch.tensor([t]))
                     try:
                         box["new"], _ = fastgen.generate(model, step, fn, enc["input_ids"], max_new=max_new,
-                                                         eos=EOS, sampler=sampler, max_time=budget,
+                                                         eos=EOS, sampler=sampler, max_time=time_left(),
                                                          stop_flag=flag, on_token=emit)
                     except Exception as exc:
                         if sent:
                             raise
                         print(f"[fast] failed before the first token, plain generate: {exc}", flush=True)
+                        box["fell_back"] = True
                         streamer.next_tokens_are_prompt = True
                         plain()
                         return
@@ -264,7 +292,7 @@ if not MOCK:
         new = box["new"]
         n = len(new)
         yield ("done", {"tokens": n, "eos": n > 0 and int(new[-1]) == EOS and not flag.is_set(),
-                        "gen_seconds": time.time() - t0, "fast": fast is not None})
+                        "gen_seconds": time.time() - t0, "fast": fast is not None and not box.get("fell_back")})
 else:
     _mock_seen: dict = {}
 
@@ -280,18 +308,22 @@ else:
         elif "fact" in MOCK_FAULTS and "HZ_LOCK_" in draft and (draft, "fact") not in _mock_seen:
             _mock_seen[(draft, "fact")] = 1     # the next one drops the kept passages
             out = re.sub(r"\[\[_*HZ_LOCK_\d+\]\]", "something else", out)
+        cut = len(out)
+        if "cut" in MOCK_FAULTS and (draft, "cut") not in _mock_seen:
+            _mock_seen[(draft, "cut")] = 1      # stops halfway, as when max_time runs out on a slow worker
+            cut = len(out) // 2
         time.sleep(1.2)
         t0, n, text = time.time(), 0, ""
-        for k in range(0, len(out), 6):
+        for k in range(0, cut, 6):
             time.sleep(0.02)
             n += 1
-            text += out[k:k + 6]
+            text += out[k:min(k + 6, cut)]
             if en_guard and hz_text.language_drift("", text):
                 yield ("drift", None)
                 yield ("done", {"tokens": n, "eos": False, "gen_seconds": time.time() - t0})
                 return
-            yield ("text", out[k:k + 6])
-        yield ("done", {"tokens": n, "eos": True, "gen_seconds": time.time() - t0})
+            yield ("text", out[k:min(k + 6, cut)])
+        yield ("done", {"tokens": n, "eos": cut == len(out), "gen_seconds": time.time() - t0})
 
 
 # ───────────────────────────────────────────────────────────── usage log
@@ -473,7 +505,9 @@ def _join(xs, zh=False):
     return ("、" if zh else ", ").join(html.escape(x) for x in xs)
 
 
-def panel_done(draft: str, out: str, info: dict, wall: float, cjk: bool, extra=()) -> str:
+def panel_done(draft: str, out: str, info: dict, wall: float, cjk: bool, extra=(), cut_parts=None, n_parts: int = 1) -> str:
+    """cut_parts: indices of the parts whose sample stopped at max_new_tokens or max_time (None: not tracked, use the
+    generic note); a part the GPU stopped in is explained by a note in extra instead."""
     import diffmark
 
     chk = hz_text.check(draft, out, truncated=not info.get("eos", True))
@@ -507,7 +541,19 @@ def panel_done(draft: str, out: str, info: dict, wall: float, cjk: bool, extra=(
         notes.append(("warn",
                       f"Numbers in the rewrite that are not in the draft: <b>{_join(chk.added_numbers)}</b>. Arithmetic the model did, or an invented figure. Check them.",
                       f"改写里多出了草稿里没有的数字：<b>{_join(chk.added_numbers, True)}</b>。可能是模型自己换算的，也可能是编的，请核对。"))
-    if "truncated" in chk.issues:
+    if "truncated" in chk.issues and cut_parts and n_parts > 1:
+        nums = [str(i + 1) for i in cut_parts]
+        one, rest = len(nums) == 1, len(nums) < n_parts
+        en_which = (f"Part {nums[0]}" if one else "Parts " + ", ".join(nums[:-1]) + " and " + nums[-1])
+        notes.append(("warn",
+                      f"{en_which} of {n_parts} stopped at this demo's length or time limit, so the end of "
+                      f"{'that part' if one else 'each of those parts'} is cut off"
+                      f"{'; the other parts are complete' if rest else ''}. Press the arrow again, paste "
+                      f"{'that part on its own' if one else 'them on their own'}, or use the app or <code>hz</code> for long text.",
+                      f"第 {'、'.join(nums)} 段（共 {n_parts} 段）达到了本页的长度或时间上限，"
+                      f"{'这一段' if one else '这几段'}的结尾被截断了{'，其余各段是完整的' if rest else ''}。"
+                      f"可以再点一次箭头，把{'这一段' if one else '它们'}单独贴进来改，或者用 App / <code>hz</code> 处理长文。"))
+    elif "truncated" in chk.issues and (cut_parts is None or cut_parts):
         notes.append(("warn",
                       "Stopped at this demo's length or time limit, so the ending is cut off. Split the draft, or use the app or <code>hz</code> for long text.",
                       "达到了本页的长度或时间上限，结尾被截断了。请分段改写，或者用 App / <code>hz</code> 处理长文。"))
@@ -670,6 +716,7 @@ def rewrite(draft: str, facts_raw: str = "[]"):
     yield panel_wait()
     t0, done_out, done_draft = time.time(), "", ""
     toks, gsec, eos_all, stop, retries = 0, 0.0, True, None, 0
+    cut_parts = []                                      # parts whose sample hit max_new_tokens or max_time
     lang_resampled, lang_kept_wrong, fact_tries_extra = 0, 0, 0
     run_params = {"max_new_tokens": [], "facts": len(prot.locks), "parts": len(parts), "fast": None}
     for i, (part, sep) in enumerate(todo):
@@ -738,6 +785,8 @@ def rewrite(draft: str, facts_raw: str = "[]"):
             toks += (info or {}).get("tokens", 0) or 0
             gsec += (info or {}).get("gen_seconds", 0.0) or 0.0
             eos_all = eos_all and bool((info or {}).get("eos", False)) and not err
+            if not err and not (info or {}).get("eos", False):
+                cut_parts.append(i)
         if err or not out:
             stop = (i, err or "empty sample twice")
             break
@@ -800,9 +849,11 @@ def rewrite(draft: str, facts_raw: str = "[]"):
     log_use(outcome="ok" if not (stop or left) else "partial", lang="zh" if cjk else "en", out_tokens=toks,
             eos=eos_all, copy=round(hz_text.copy_rate(drafted, out_all), 3), gen_seconds=round(gsec, 1),
             err=(None if not stop else "facts" if facts_failed else _log_gpu_error(stop[1])),
-            err_msg=(None if not stop or facts_failed else _err_msg(stop[1])), left_parts=len(left), **base)
+            err_msg=(None if not stop or facts_failed else _err_msg(stop[1])), left_parts=len(left),
+            fast=run_params["fast"], cut_parts=len(cut_parts), **base)
     record("ok" if not (stop or left) else "partial")
-    yield panel_done(drafted, out_all, {"tokens": toks, "eos": eos_all, "gen_seconds": gsec}, wall, cjk, extra)
+    yield panel_done(drafted, out_all, {"tokens": toks, "eos": eos_all, "gen_seconds": gsec}, wall, cjk, extra,
+                     cut_parts=cut_parts, n_parts=len(todo))
 
 
 def humanize(draft: str) -> dict:
@@ -852,7 +903,7 @@ def humanize(draft: str) -> dict:
     chk = hz_text.check(draft, out, truncated=not info.get("eos", True))
     log_use(outcome="api_ok" if out else "api_empty", in_units=hz_text.count_words(draft), in_tokens=n_tok,
             out_tokens=info.get("tokens"), eos=info.get("eos"), copy=chk.copy, seconds=round(time.time() - t0, 1),
-            lang_resampled=resampled)
+            gen_seconds=round(info.get("gen_seconds", 0.0), 1), fast=info.get("fast"), lang_resampled=resampled)
     return {"text": out, "copy_rate": chk.copy, "missing_numbers": chk.missing_numbers,
             "added_numbers": chk.added_numbers, "tokens": info.get("tokens"), "truncated": chk.truncated,
             "seconds": round(time.time() - t0, 1), "gen_seconds": round(info.get("gen_seconds", 0.0), 1),
